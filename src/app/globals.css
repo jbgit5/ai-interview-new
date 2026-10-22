@@ -1,0 +1,90 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --sc-bg:           #f4f5f9;
+  --sc-surface:      #ffffff;
+  --sc-border:       #e2e4ec;
+  --sc-sidebar:      #09090f;
+  --sc-sidebar-bd:   #1a1b25;
+  --sc-accent:       #7c3aed;
+  --sc-accent-hi:    #9d5cf6;
+  --sc-accent-glow:  rgba(124,58,237,0.25);
+  --sc-text:         #0f1117;
+  --sc-muted:        #6b7280;
+  --sc-success:      #059669;
+  --sc-warning:      #d97706;
+  --sc-danger:       #dc2626;
+
+  --background: var(--sc-bg);
+  --foreground: var(--sc-text);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  color: var(--sc-text);
+  background: var(--sc-bg);
+  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+@layer utilities {
+  .text-balance { text-wrap: balance; }
+
+  .sc-card {
+    @apply bg-white rounded-2xl border border-[#e2e4ec] shadow-sm;
+  }
+
+  .sc-btn-primary {
+    @apply inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed;
+    background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%);
+    box-shadow: 0 1px 3px rgba(124,58,237,0.3), 0 4px 12px rgba(124,58,237,0.15);
+  }
+  .sc-btn-primary:hover {
+    background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);
+    box-shadow: 0 1px 3px rgba(124,58,237,0.4), 0 6px 16px rgba(124,58,237,0.2);
+  }
+
+  .sc-btn-secondary {
+    @apply inline-flex items-center gap-2 rounded-xl border border-[#e2e4ec] bg-white px-4 py-2.5 text-sm font-medium text-gray-600 shadow-sm transition-all hover:bg-gray-50 hover:border-gray-300 hover:text-gray-900 active:scale-95;
+  }
+
+  .sc-input {
+    @apply w-full rounded-xl border border-[#e2e4ec] bg-white px-3.5 py-2.5 text-sm text-gray-900 shadow-sm placeholder:text-gray-400 outline-none transition-all focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20;
+  }
+
+  .sc-label {
+    @apply block text-xs font-bold uppercase tracking-wider text-gray-400 mb-2;
+  }
+}
+
+.sc-nav-active {
+  background: linear-gradient(90deg, rgba(124,58,237,0.18) 0%, rgba(124,58,237,0.04) 100%);
+  border-left: 2px solid #7c3aed;
+  color: #c4b5fd !important;
+}
+.sc-nav-active svg { color: #a78bfa !important; }
+
+.sc-gradient-text {
+  background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 50%, #60a5fa 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.sc-auth-panel {
+  background: linear-gradient(160deg, #04060d 0%, #080f1e 55%, #04060d 100%);
+}
+
+@keyframes scPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(124,58,237,0.4); }
+  50%       { box-shadow: 0 0 0 8px rgba(124,58,237,0); }
+}
+.sc-logo-pulse { animation: scPulse 2.5s ease-in-out infinite; }

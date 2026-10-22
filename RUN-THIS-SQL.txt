@@ -1,0 +1,9 @@
+Quick reference: SQL migrations live in db/migrations/
+
+1. Start local Postgres: npm run db:local:up
+2. Apply schema: npm run db:local:setup   (or npm run db:local:migrate for incremental)
+
+Or use psql with DATABASE_URL pointing at your Postgres:
+   psql "$DATABASE_URL" -f db/migrations/000_better_auth.sql
+   psql "$DATABASE_URL" -f db/migrations/001_core_tables.sql
+   ... (see db/migrations/README.md)
