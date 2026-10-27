@@ -13,6 +13,8 @@ import {
   Zap,
   Building2,
   Activity,
+  Stethoscope,
+  Settings,
 } from "lucide-react";
 
 const navItems = [
@@ -22,7 +24,9 @@ const navItems = [
   { href: "/dashboard/company-intro", label: "Company Intro", icon: Building2 },
   { href: "/dashboard/voice-test", label: "Voice Lab",  icon: Mic },
   { href: "/dashboard/avatar",     label: "Avatars",    icon: Bot },
+  { href: "/dashboard/diagnostics", label: "Diagnostics", icon: Stethoscope },
   { href: "/dashboard/observability", label: "Observability", icon: Activity },
+  { href: "/dashboard/settings", label: "Settings", icon: Settings },
 ];
 
 export default function Sidebar() {

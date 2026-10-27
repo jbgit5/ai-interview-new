@@ -1,19 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import { PENALTY, type ProctorEventType } from "@/lib/proctor/rules";
+import { useAiProctor, type AiProctorStatus } from "@/hooks/useAiProctor";
 
-export type ProctoringEventType =
-  | "tab_switch"
-  | "window_blur"
-  | "window_focus"
-  | "multi_face"
-  | "no_face"
-  | "gaze_away"
-  | "paste_detected"
-  | "right_click"
-  | "devtools_open"
-  | "fullscreen_exit"
-  | "phone_detected";
+export type ProctoringEventType = ProctorEventType;
+
+/** Camera-based violations get a snapshot as evidence for the recruiter. */
+const SNAPSHOT_TYPES = new Set<ProctoringEventType>(["no_face", "multi_face", "gaze_away", "phone_detected"]);
+const SNAPSHOT_WIDTH = 320;
 
 export type ProctoringViolation = {
   id: string;
@@ -29,21 +24,13 @@ interface UseProctoringOptions {
   sessionToken: string;
   videoRef: React.RefObject<HTMLVideoElement>;
   enabled: boolean;
+  /** Room is ready (candidate on the "Ready?" screen): start downloading the AI models now. */
+  aiPreload?: boolean;
+  onTelemetry?: (eventName: string, attrs?: Record<string, unknown>) => void;
 }
 
-const PENALTY: Record<ProctoringEventType, number> = {
-  tab_switch:       10,
-  window_blur:       5,
-  window_focus:      0,
-  multi_face:       15,
-  no_face:           8,
-  gaze_away:         3,
-  paste_detected:    5,
-  right_click:       2,
-  devtools_open:    20,
-  fullscreen_exit:   5,
-  phone_detected:   20,
-};
+// PENALTY now comes from src/lib/proctor/rules.ts — the same table the server uses to compute the
+// final integrity score, so the live number and the stored one can't drift apart.
 
 const SEVERITY: Record<ProctoringEventType, "low" | "medium" | "high"> = {
   tab_switch:       "medium",
@@ -57,6 +44,7 @@ const SEVERITY: Record<ProctoringEventType, "low" | "medium" | "high"> = {
   devtools_open:    "high",
   fullscreen_exit:  "medium",
   phone_detected:   "high",
+  multiple_monitors: "high",
 };
 
 const MSG: Record<ProctoringEventType, string> = {
@@ -65,15 +53,30 @@ const MSG: Record<ProctoringEventType, string> = {
   window_focus:     "Window focused",
   multi_face:       "Multiple people detected",
   no_face:          "Face not visible — please stay in frame",
-  gaze_away:        "Please look at the camera",
+  gaze_away:        "Please keep looking at the screen",
   paste_detected:   "Pasting text is not allowed",
   right_click:      "Right-click is disabled during the interview",
   devtools_open:    "Developer tools detected",
   fullscreen_exit:  "Please stay in fullscreen mode",
   phone_detected:   "Secondary device detected",
+  multiple_monitors: "A second monitor was detected — please disconnect extra displays",
 };
 
-export function useProctor({ sessionToken, videoRef, enabled }: UseProctoringOptions) {
+/** A small JPEG of the candidate's camera at this moment, or undefined if unavailable. */
+function captureSnapshot(video: HTMLVideoElement | null): string | undefined {
+  try {
+    if (!video || video.readyState < 2 || !video.videoWidth) return undefined;
+    const canvas = document.createElement("canvas");
+    canvas.width = SNAPSHOT_WIDTH;
+    canvas.height = Math.round((video.videoHeight / video.videoWidth) * SNAPSHOT_WIDTH);
+    canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", 0.7);
+  } catch {
+    return undefined;
+  }
+}
+
+export function useProctor({ sessionToken, videoRef, enabled, aiPreload = false, onTelemetry }: UseProctoringOptions) {
   const [integrityScore, setIntegrityScore] = useState(100);
   const [violations, setViolations] = useState<ProctoringViolation[]>([]);
   const [activeWarning, setActiveWarning] = useState<ProctoringViolation | null>(null);
@@ -110,6 +113,9 @@ export function useProctor({ sessionToken, videoRef, enabled }: UseProctoringOpt
     if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
     warningTimerRef.current = setTimeout(() => setActiveWarning(null), 4000);
 
+    // Evidence: a snapshot of the camera for camera-based violations.
+    const snapshot = SNAPSHOT_TYPES.has(type) ? captureSnapshot(videoRef.current) : undefined;
+
     // Send to server (non-blocking)
     try {
       await fetch(`/api/sessions/${sessionToken}/proctor`, {
@@ -120,12 +126,24 @@ export function useProctor({ sessionToken, videoRef, enabled }: UseProctoringOpt
           timestamp_ms: timestampMs,
           severity,
           metadata: meta ?? {},
+          ...(snapshot ? { snapshot } : {}),
         }),
       });
     } catch {
       // Non-fatal — proctoring continues even if server is unreachable
     }
-  }, [enabled, sessionToken]);
+  }, [enabled, sessionToken, videoRef]);
+
+  // ── AI detection (face / people / looking away / phone) ────────────────────
+  const { status: aiStatus } = useAiProctor({
+    videoRef,
+    preload: aiPreload || enabled,
+    enabled,
+    onFinding: (f) => void logViolation(f.type, { ...f.meta, source: "ai" }),
+    onTelemetry,
+  });
+  const aiStatusRef = useRef<AiProctorStatus>(aiStatus);
+  aiStatusRef.current = aiStatus;
 
   // ── Tab/window visibility ──────────────────────────────────────────────────
   useEffect(() => {
@@ -158,6 +176,33 @@ export function useProctor({ sessionToken, videoRef, enabled }: UseProctoringOpt
       window.removeEventListener("focus", onFocus);
     };
   }, [enabled, logViolation]);
+
+  // ── Extended desktop (second monitor) ──────────────────────────────────────
+  // Chromium (Chrome, Edge) exposes `screen.isExtended` without a permission prompt. Checked when the
+  // interview starts, whenever the display setup changes, and every 5 s as a backstop; ONE violation
+  // per "became extended" transition (not one per poll). Firefox/Safari don't expose it, so there it
+  // can't be detected — recorded once as telemetry so the recruiter knows the check didn't run.
+  useEffect(() => {
+    if (!enabled) return;
+    const scr = window.screen as unknown as EventTarget & { isExtended?: boolean };
+    if (typeof scr.isExtended !== "boolean") {
+      onTelemetry?.("proctor.monitors.unsupported", {});
+      return;
+    }
+    let wasExtended = false;
+    const check = () => {
+      const now = scr.isExtended === true;
+      if (now && !wasExtended) logViolation("multiple_monitors", { source: "screen.isExtended" });
+      wasExtended = now;
+    };
+    check();
+    scr.addEventListener("change", check);
+    const poll = setInterval(check, 5000);
+    return () => {
+      scr.removeEventListener("change", check);
+      clearInterval(poll);
+    };
+  }, [enabled, logViolation, onTelemetry]);
 
   // ── Paste detection ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -240,6 +285,9 @@ export function useProctor({ sessionToken, videoRef, enabled }: UseProctoringOpt
     canvas.height = 60;
 
     faceCheckIntervalRef.current = setInterval(() => {
+      // These pixel heuristics are only the FALLBACK: while the AI detector is running it owns
+      // face / phone detection (the skin-tone and bright-patch guesses are unreliable).
+      if (aiStatusRef.current === "ready") return;
       const video = videoRef.current;
       if (!video || video.readyState < 2) return;
 
@@ -334,5 +382,7 @@ export function useProctor({ sessionToken, videoRef, enabled }: UseProctoringOpt
     activeWarning,
     dismissWarning,
     focusStatus,
+    /** "ready" = AI detection running; "unavailable" = fell back to the lightweight checks. */
+    aiStatus,
   };
 }

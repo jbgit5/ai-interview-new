@@ -59,6 +59,7 @@ RSYNC_EXCLUDES=(
   --exclude .env.local
   --exclude .env.development
   --exclude recordings
+  --exclude cv-uploads
   --exclude .cursor
 )
 

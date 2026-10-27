@@ -8,6 +8,8 @@ export const INTERVIEWER_AVATAR_IDS = [
   "zara",
   "chen",
   "nova",
+  /** Real-person photo avatar. Lip-synced video via Simli when enabled + GPT-Live; static photo otherwise. */
+  "real",
 ] as const;
 
 export type InterviewerAvatarId = (typeof INTERVIEWER_AVATAR_IDS)[number];

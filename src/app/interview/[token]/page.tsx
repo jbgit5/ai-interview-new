@@ -4,6 +4,7 @@ import { format } from "date-fns";
 import { CalendarClock, XCircle, Clock, Lock } from "lucide-react";
 import ConsentButton from "./ConsentButton";
 import CompletedScreen from "./CompletedScreen";
+import { estimateInterviewMinutes } from "@/lib/interviewDuration";
 
 interface PageProps {
   params: { token: string };
@@ -21,7 +22,10 @@ export default async function InterviewLandingPage({ params }: PageProps) {
        j.title AS job_title,
        j.department,
        r.company_name,
-       r.name AS recruiter_name
+       r.name AS recruiter_name,
+       (SELECT COUNT(*)::int FROM questions q
+         WHERE (q.job_id = s.job_id AND q.session_id IS NULL) OR q.session_id = s.id
+       ) AS question_count
      FROM interview_sessions s
      JOIN jobs j ON j.id = s.job_id
      JOIN recruiters r ON r.id = j.recruiter_id
@@ -65,6 +69,7 @@ export default async function InterviewLandingPage({ params }: PageProps) {
               companyName={companyName}
               expiresAt={session.expires_at}
               token={params.token}
+              questionCount={session.question_count ?? 0}
             />
           )}
         </div>
@@ -84,6 +89,7 @@ function ActiveState({
   companyName,
   expiresAt,
   token,
+  questionCount,
 }: {
   candidateName: string | null;
   jobTitle: string;
@@ -91,7 +97,9 @@ function ActiveState({
   companyName: string;
   expiresAt: string;
   token: string;
+  questionCount: number;
 }) {
+  const { low, high } = estimateInterviewMinutes(questionCount);
   return (
     <>
       <div className="mb-6 flex items-start gap-3">
@@ -118,7 +126,7 @@ function ActiveState({
 
       <p className="mb-4 text-sm text-gray-600">
         You&apos;ve been invited to complete an AI-powered video interview for
-        this role. It takes approximately <strong>15–20 minutes</strong> and
+        this role. It takes approximately <strong>{low}–{high} minutes</strong> and
         can be done from anywhere.
       </p>
 

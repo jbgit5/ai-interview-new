@@ -14,6 +14,8 @@ interface JobData {
   status: JobStatus;
   question_mode: string;
   allow_probes: boolean;
+  live_voice_enabled?: boolean;
+  live_voice_available?: boolean;
 }
 
 const STATUS_OPTIONS: { value: JobStatus; label: string; color: string }[] = [
@@ -38,6 +40,7 @@ export default function JobEditPage() {
   const [description, setDescription] = useState("");
   const [status, setStatus] = useState<JobStatus>("draft");
   const [allowProbes, setAllowProbes] = useState<boolean>(true);
+  const [liveVoice, setLiveVoice] = useState<boolean>(false);
 
   useEffect(() => {
     fetch(`/api/jobs/${params.jobId}`)
@@ -49,6 +52,7 @@ export default function JobEditPage() {
         setDescription(data.description ?? "");
         setStatus(data.status ?? "draft");
         setAllowProbes(data.allow_probes !== false);
+        setLiveVoice(data.live_voice_enabled === true);
       })
       .catch(() => setError("Failed to load job"))
       .finally(() => setLoading(false));
@@ -70,6 +74,8 @@ export default function JobEditPage() {
           description: description.trim() || null,
           status,
           allow_probes: allowProbes,
+          // Only sent when the server offers live voice, so normal saves are unaffected.
+          ...(job?.live_voice_available ? { live_voice_enabled: liveVoice } : {}),
         }),
       });
 
@@ -195,6 +201,49 @@ export default function JobEditPage() {
             </span>
           </button>
         </div>
+
+        {/* GPT-Live voice (experimental) — only shown when the server has it enabled */}
+        {job.live_voice_available && (
+          <div>
+            <label className="sc-label">Voice Engine (Experimental)</label>
+            <button
+              type="button"
+              onClick={() => setLiveVoice((v) => !v)}
+              className="flex w-full items-start justify-between gap-4 rounded-xl border-2 border-gray-200 bg-white p-4 text-left transition-colors hover:border-gray-300"
+            >
+              <div className="flex-1">
+                <div className="flex items-center gap-2">
+                  <p className="text-sm font-bold text-gray-900">Use GPT-Live voice</p>
+                  <span
+                    className="rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide"
+                    style={{ background: liveVoice ? "#7c3aed" : "#9ca3af", color: "#fff" }}
+                  >
+                    {liveVoice ? "On" : "Off"}
+                  </span>
+                </div>
+                <p className="mt-1 text-xs leading-relaxed text-gray-500">
+                  {liveVoice
+                    ? "Interviews for this job use OpenAI's GPT-Live for a more natural, faster conversation. Billed per minute of interview and capped by server limits. Falls back to the standard voice automatically if it can't start."
+                    : "Standard voice (Deepgram + OpenAI TTS). Turn on to try the experimental GPT-Live voice for this job."}
+                </p>
+              </div>
+              <span
+                role="switch"
+                aria-checked={liveVoice}
+                className="relative mt-1 inline-flex h-6 w-11 flex-shrink-0 rounded-full border-2 transition-colors"
+                style={{
+                  background: liveVoice ? "#7c3aed" : "#e5e7eb",
+                  borderColor: liveVoice ? "#7c3aed" : "#d1d5db",
+                }}
+              >
+                <span
+                  className="inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition-transform"
+                  style={{ transform: liveVoice ? "translateX(20px)" : "translateX(2px)", marginTop: "2px" }}
+                />
+              </span>
+            </button>
+          </div>
+        )}
 
         <div>
           <label className="sc-label">Company Introduction</label>

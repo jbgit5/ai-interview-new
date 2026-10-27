@@ -6,10 +6,13 @@ import { auth } from "@/lib/auth";
 import { pool } from "@/lib/db";
 import TabLink from "@/components/dashboard/TabLink";
 
+// Hiring flow order: screen CVs → tune requirements → prepare interview questions → invite.
 const TABS = [
-  { label: "Questions", href: (id: string) => `/dashboard/jobs/${id}/questions` },
-  { label: "Invite", href: (id: string) => `/dashboard/jobs/${id}/invite` },
-  { label: "Edit", href: (id: string) => `/dashboard/jobs/${id}/edit` },
+  { label: "Candidates", href: (id: string) => `/dashboard/jobs/${id}/screening` },
+  { label: "Requirements", href: (id: string) => `/dashboard/jobs/${id}/requirements` },
+  { label: "Interview questions", href: (id: string) => `/dashboard/jobs/${id}/questions` },
+  { label: "Invites", href: (id: string) => `/dashboard/jobs/${id}/invite` },
+  { label: "Settings", href: (id: string) => `/dashboard/jobs/${id}/edit` },
 ];
 
 export default async function JobDetailLayout({

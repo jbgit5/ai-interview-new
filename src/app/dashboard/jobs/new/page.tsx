@@ -1,277 +1,240 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Loader2, Sparkles, ListChecks, Shuffle, FileSearch } from "lucide-react";
+import { ArrowLeft, FileText, Loader2, Sparkles, UploadCloud, X } from "lucide-react";
+import RequirementsEditor, { cleanCriteria } from "@/components/screening/RequirementsEditor";
+import { DEFAULT_CRITERIA, type Criteria } from "@/lib/screening/criteria";
 
-const MODES = [
-  {
-    value: "ai_only",
-    icon: Sparkles,
-    label: "AI Generated",
-    tag: "Recommended",
-    description: "AI creates 7 tailored questions from your job description.",
-    color: "#7c3aed",
-    bgIdle: "#f5f3ff",
-    bgActive: "#ede9fe",
-    borderActive: "#7c3aed",
-    iconBg: "#ddd6fe",
-  },
-  {
-    value: "custom_only",
-    icon: ListChecks,
-    label: "Custom Bank",
-    tag: null,
-    description: "Write all questions manually — full control.",
-    color: "#2563eb",
-    bgIdle: "#eff6ff",
-    bgActive: "#dbeafe",
-    borderActive: "#2563eb",
-    iconBg: "#bfdbfe",
-  },
-  {
-    value: "mixed",
-    icon: Shuffle,
-    label: "Mixed",
-    tag: null,
-    description: "AI generates a starter set, then you customise.",
-    color: "#d97706",
-    bgIdle: "#fffbeb",
-    bgActive: "#fef3c7",
-    borderActive: "#d97706",
-    iconBg: "#fde68a",
-  },
-  {
-    value: "resume" as const,
-    icon: FileSearch,
-    label: "Resume-Based",
-    tag: null,
-    description: "AI generates personal questions from each candidate's CV.",
-    color: "#059669",
-    bgIdle: "#f0fdf4",
-    bgActive: "#dcfce7",
-    borderActive: "#059669",
-    iconBg: "#bbf7d0",
-  },
-] as const;
+// Create a job from its JD: upload or paste the JD → AI drafts the title and requirements →
+// recruiter reviews/edits on one screen → create. Interview questions are made later.
+
+type Step = "source" | "review";
 
 export default function NewJobPage() {
   const router = useRouter();
-  const [loading, setLoading] = useState(false);
+  const [step, setStep] = useState<Step>("source");
+  const [mode, setMode] = useState<"upload" | "paste">("upload");
+  const [file, setFile] = useState<File | null>(null);
+  const [pasted, setPasted] = useState("");
+  const [reading, setReading] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [questionMode, setQuestionMode] = useState<"ai_only" | "custom_only" | "mixed" | "resume">("ai_only");
-  const [allowProbes, setAllowProbes] = useState<boolean>(true);
+  const fileInput = useRef<HTMLInputElement>(null);
 
-  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
-    e.preventDefault();
+  const [title, setTitle] = useState("");
+  const [department, setDepartment] = useState("");
+  const [description, setDescription] = useState("");
+  const [status, setStatus] = useState<"draft" | "active">("active");
+  const [criteria, setCriteria] = useState<Criteria>(DEFAULT_CRITERIA);
+  const [aiFilled, setAiFilled] = useState(false);
+  const [showJd, setShowJd] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [issues, setIssues] = useState<string[]>([]);
+
+  async function readJd() {
     setError(null);
-    setLoading(true);
-    const formData = new FormData(e.currentTarget);
-    const payload = {
-      title: formData.get("title") as string,
-      department: formData.get("department") as string,
-      description: formData.get("description") as string,
-      status: formData.get("status") as string,
-      question_mode: questionMode,
-      allow_probes: allowProbes,
-    };
+    setNotice(null);
+    setReading(true);
+    try {
+      let res: Response;
+      if (mode === "upload") {
+        if (!file) throw new Error("Choose a PDF or DOCX file first.");
+        const fd = new FormData();
+        fd.append("file", file);
+        res = await fetch("/api/jobs/draft", { method: "POST", body: fd });
+      } else {
+        res = await fetch("/api/jobs/draft", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: pasted }) });
+      }
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // The text may still be usable even if the AI step failed.
+        if (d.description) {
+          setDescription(d.description);
+          setNotice(d.error ?? "Couldn't read requirements automatically.");
+          setStep("review");
+          return;
+        }
+        throw new Error(d.error ?? "Couldn't read the job description.");
+      }
+      setTitle(d.title ?? "");
+      setDepartment(d.department ?? "");
+      setDescription(d.description ?? "");
+      setCriteria(d.criteria ?? DEFAULT_CRITERIA);
+      setAiFilled(true);
+      setStep("review");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setReading(false);
+    }
+  }
+
+  async function create() {
+    setError(null);
+    setIssues([]);
+    if (!title.trim()) return setError("Add a job title.");
+    setCreating(true);
     try {
       const res = await fetch("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          title, department, description, status,
+          question_mode: "mixed",
+          allow_probes: true,
+          generate_questions: false,
+          criteria: cleanCriteria(criteria),
+        }),
       });
+      const d = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const data = await res.json();
-        setError(data.error ?? "Something went wrong");
-        return;
+        setIssues((d.issues ?? []).map((i: { path: string; message: string }) => i.message));
+        throw new Error(d.error ?? "Something went wrong");
       }
-      const job = await res.json();
-      router.push(`/dashboard/jobs/${job.id}/questions`);
-    } catch {
-      setError("Network error — please try again");
-    } finally {
-      setLoading(false);
+      router.push(`/dashboard/jobs/${d.id}/screening`);
+    } catch (e) {
+      setError((e as Error).message);
+      setCreating(false);
     }
   }
 
   return (
-    <div className="mx-auto max-w-2xl px-6 py-6">
-      {/* Breadcrumb */}
+    <div className="mx-auto max-w-4xl px-6 py-6">
       <div className="mb-5 flex items-center gap-2 text-sm">
-        <Link href="/dashboard/jobs" className="flex items-center gap-1.5 font-medium text-gray-500 hover:text-violet-600 transition-colors">
-          <ArrowLeft className="h-4 w-4" />
-          Jobs
+        <Link href="/dashboard/jobs" className="flex items-center gap-1.5 font-medium text-gray-500 transition-colors hover:text-violet-600">
+          <ArrowLeft className="h-4 w-4" /> Jobs
         </Link>
         <span className="text-gray-300">/</span>
-        <span className="text-gray-500">New Job</span>
+        <span className="text-gray-500">New job</span>
       </div>
 
       <div className="mb-6">
-        <p className="text-xs font-bold uppercase tracking-widest text-violet-500 mb-1">New Opening</p>
-        <h1 className="text-2xl font-bold text-gray-900">Create Job</h1>
-        <p className="mt-1 text-sm text-gray-500">Fill in the details and choose your interview question mode.</p>
+        <h1 className="text-2xl font-bold text-gray-900">Create job</h1>
+        <p className="mt-1 text-sm text-gray-500">
+          {step === "source"
+            ? "Start from your job description — we'll fill in the title and requirements for you to check."
+            : "Check the details and requirements, then create the job. You can change anything later."}
+        </p>
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-5">
+      {error && <p className="mb-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}
+      {issues.length > 0 && (
+        <ul className="mb-4 list-disc rounded-xl bg-red-50 px-8 py-2 text-sm text-red-700">{issues.map((m, i) => <li key={i}>{m}</li>)}</ul>
+      )}
 
-        {/* Title + Department row */}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div>
-            <label className="sc-label">Job Title <span className="text-red-500">*</span></label>
-            <input name="title" type="text" required placeholder="e.g. Senior Frontend Engineer" className="sc-input" />
+      {step === "source" && (
+        <div className="sc-card p-6">
+          <div className="mb-5 inline-flex rounded-xl bg-gray-100 p-1">
+            {(["upload", "paste"] as const).map((m) => (
+              <button key={m} type="button" onClick={() => setMode(m)}
+                className={`rounded-lg px-4 py-1.5 text-sm font-semibold transition ${mode === m ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-800"}`}>
+                {m === "upload" ? "Upload JD file" : "Paste JD text"}
+              </button>
+            ))}
           </div>
-          <div>
-            <label className="sc-label">Department</label>
-            <input name="department" type="text" placeholder="e.g. Engineering" className="sc-input" />
-          </div>
-        </div>
 
-        {/* Description */}
-        <div>
-          <label className="sc-label">Job Description</label>
-          <textarea name="description" rows={5} placeholder="Describe the role, responsibilities, and requirements..." className="sc-input resize-none" />
-          <p className="mt-1.5 text-xs text-gray-400">Used by AI to generate relevant interview questions.</p>
-        </div>
-
-        {/* Question Mode */}
-        <div>
-          <label className="sc-label">Interview Question Mode <span className="text-red-500">*</span></label>
-          <div className="grid grid-cols-2 gap-3">
-            {MODES.map(({ value, icon: Icon, label, tag, description, color, bgIdle, bgActive, borderActive, iconBg }) => {
-              const isActive = questionMode === value;
-              return (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => setQuestionMode(value)}
-                  className="relative rounded-xl p-4 text-left transition-all duration-150 border-2"
-                  style={{
-                    background: isActive ? bgActive : bgIdle,
-                    borderColor: isActive ? borderActive : "transparent",
-                    boxShadow: isActive ? `0 0 0 0px ${borderActive}` : "none",
-                  }}
-                >
-                  {/* Icon badge */}
-                  <span
-                    className="mb-3 flex h-9 w-9 items-center justify-center rounded-lg"
-                    style={{ background: iconBg }}
-                  >
-                    <Icon className="h-4.5 w-4.5" style={{ color }} />
-                  </span>
-
-                  {/* Label + tag */}
-                  <div className="flex items-center gap-2 mb-1">
-                    <p className="text-sm font-bold text-gray-900">{label}</p>
-                    {tag && (
-                      <span
-                        className="rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide"
-                        style={{ background: color, color: "#fff" }}
-                      >
-                        {tag}
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-xs leading-relaxed text-gray-500">{description}</p>
-
-                  {/* Selected checkmark */}
-                  {isActive && (
-                    <span
-                      className="absolute right-3 top-3 flex h-5 w-5 items-center justify-center rounded-full"
-                      style={{ background: borderActive }}
-                    >
-                      <svg className="h-3 w-3 text-white" fill="none" viewBox="0 0 12 12">
-                        <path d="M2.5 6l2.5 2.5L9.5 3.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-          {questionMode !== "custom_only" && (
-            <p className="mt-2 flex items-center gap-1.5 text-xs text-violet-600">
-              <Sparkles className="h-3.5 w-3.5" />
-              AI will generate questions on submit — takes ~5 seconds.
-            </p>
+          {mode === "upload" ? (
+            <div
+              role="button" tabIndex={0}
+              onClick={() => fileInput.current?.click()}
+              onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && fileInput.current?.click()}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) setFile(f); }}
+              className="flex cursor-pointer flex-col items-center rounded-2xl border-2 border-dashed border-gray-200 px-6 py-12 text-center transition hover:border-violet-300 hover:bg-violet-50/30"
+            >
+              {file ? (
+                <div className="flex items-center gap-3 rounded-xl bg-violet-50 px-4 py-3">
+                  <FileText className="h-5 w-5 text-violet-600" />
+                  <span className="text-sm font-semibold text-gray-900">{file.name}</span>
+                  <button type="button" onClick={(e) => { e.stopPropagation(); setFile(null); }} aria-label="Remove file" className="rounded p-1 text-gray-400 hover:text-gray-700">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <UploadCloud className="h-9 w-9 text-violet-600" />
+                  <p className="mt-3 text-sm font-semibold text-gray-900">Drop the job description here, or click to choose</p>
+                  <p className="mt-1 text-xs text-gray-500">PDF or DOCX, up to 5 MB</p>
+                </>
+              )}
+              <input ref={fileInput} type="file" accept=".pdf,.docx" className="hidden" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+            </div>
+          ) : (
+            <textarea value={pasted} onChange={(e) => setPasted(e.target.value)} rows={12} className="sc-input resize-y"
+              placeholder="Paste the full job description — responsibilities, required skills, experience, location…" aria-label="Job description text" />
           )}
-        </div>
 
-        {/* Allow follow-up probes */}
-        <div>
-          <label className="sc-label">Interview Behavior</label>
-          <button
-            type="button"
-            onClick={() => setAllowProbes((v) => !v)}
-            className="flex w-full items-start justify-between gap-4 rounded-xl border-2 border-gray-200 bg-white p-4 text-left transition-colors hover:border-gray-300"
-          >
-            <div className="flex-1">
-              <div className="flex items-center gap-2">
-                <p className="text-sm font-bold text-gray-900">Allow follow-up probes</p>
-                <span
-                  className="rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide"
-                  style={{ background: allowProbes ? "#7c3aed" : "#9ca3af", color: "#fff" }}
-                >
-                  {allowProbes ? "On" : "Off"}
-                </span>
+          <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+            <button type="button" onClick={() => setStep("review")} className="text-sm font-medium text-gray-500 hover:text-gray-800">
+              Skip — fill in manually
+            </button>
+            <button type="button" onClick={readJd} disabled={reading || (mode === "upload" ? !file : pasted.trim().length < 50)} className="sc-btn-primary">
+              {reading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+              {reading ? "Reading job description…" : "Continue"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {step === "review" && (
+        <div className="space-y-5">
+          {notice && <p className="rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-800 ring-1 ring-amber-200">{notice}</p>}
+
+          <div className="sc-card space-y-4 p-6">
+            <div className="grid gap-4 sm:grid-cols-[2fr_1fr_auto]">
+              <div>
+                <label className="sc-label">Job title *</label>
+                <input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={160} className="sc-input" placeholder="e.g. Senior Backend Engineer" />
               </div>
-              <p className="mt-1 text-xs leading-relaxed text-gray-500">
-                {allowProbes
-                  ? "Maya may ask short follow-up questions to dig deeper into shallow or unclear answers (up to 2 per question)."
-                  : "Strict bank-only mode. Maya asks each bank question exactly once, then closes — no follow-ups, even for weak or off-topic answers."}
+              <div>
+                <label className="sc-label">Department</label>
+                <input value={department} onChange={(e) => setDepartment(e.target.value)} maxLength={120} className="sc-input" placeholder="e.g. Engineering" />
+              </div>
+              <div>
+                <label className="sc-label">Status</label>
+                <div className="inline-flex rounded-xl bg-gray-100 p-1">
+                  {(["active", "draft"] as const).map((s) => (
+                    <button key={s} type="button" onClick={() => setStatus(s)}
+                      className={`rounded-lg px-3 py-1.5 text-sm font-semibold capitalize ${status === s ? "bg-white text-gray-900 shadow-sm" : "text-gray-500"}`}>
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div>
+              <button type="button" onClick={() => setShowJd(!showJd)} className="text-xs font-semibold text-violet-700 hover:underline">
+                {showJd ? "Hide job description" : description ? "View / edit job description" : "Add job description"}
+              </button>
+              {showJd && (
+                <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={10} className="sc-input mt-2 resize-y" aria-label="Job description" />
+              )}
+            </div>
+          </div>
+
+          <div className="sc-card p-6">
+            <div className="mb-4">
+              <h2 className="text-base font-semibold text-gray-900">Requirements</h2>
+              <p className="mt-0.5 text-sm text-gray-500">
+                {aiFilled
+                  ? "Filled in from your job description. Mark real deal-breakers as Must have — everything else stays Important or Nice to have."
+                  : "Used to screen CVs for this job. Mark real deal-breakers as Must have."}
               </p>
             </div>
-            <span
-              role="switch"
-              aria-checked={allowProbes}
-              className="relative mt-1 inline-flex h-6 w-11 flex-shrink-0 rounded-full border-2 transition-colors"
-              style={{
-                background: allowProbes ? "#7c3aed" : "#e5e7eb",
-                borderColor: allowProbes ? "#7c3aed" : "#d1d5db",
-              }}
-            >
-              <span
-                className="inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition-transform"
-                style={{ transform: allowProbes ? "translateX(20px)" : "translateX(2px)", marginTop: "2px" }}
-              />
-            </span>
-          </button>
+            <RequirementsEditor value={criteria} onChange={setCriteria} />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <button type="button" onClick={() => setStep("source")} className="sc-btn-secondary">Back</button>
+            <button type="button" onClick={create} disabled={creating} className="sc-btn-primary">
+              {creating && <Loader2 className="h-4 w-4 animate-spin" />} Create job
+            </button>
+          </div>
+          <p className="text-right text-xs text-gray-400">Next: upload CVs to screen. Interview questions can be added any time from the job.</p>
         </div>
-
-        {/* Status */}
-        <div>
-          <label className="sc-label">Job Status</label>
-          <select name="status" defaultValue="draft" className="sc-input">
-            <option value="draft">Draft — hidden from invite links</option>
-            <option value="active">Active — candidates can start interviews</option>
-            <option value="closed">Closed</option>
-          </select>
-        </div>
-
-        {/* Error */}
-        {error && (
-          <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600">{error}</div>
-        )}
-
-        {/* Actions */}
-        <div className="flex items-center justify-end gap-3 pt-2">
-          <Link href="/dashboard/jobs" className="sc-btn-secondary px-5 py-2.5">
-            Cancel
-          </Link>
-          <button type="submit" disabled={loading} className="sc-btn-primary px-6 py-2.5">
-            {loading ? (
-              <span className="flex items-center gap-2">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                {questionMode !== "custom_only" ? "Generating…" : "Creating…"}
-              </span>
-            ) : (
-              "Create & Add Questions"
-            )}
-          </button>
-        </div>
-
-      </form>
+      )}
     </div>
   );
 }

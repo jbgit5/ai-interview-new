@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import { useParams } from "next/navigation";
-import { Send, Copy, Check, Loader2, Mail, FileSearch, Eye, X, Sparkles } from "lucide-react";
+import { Send, Copy, Check, Loader2, Mail, FileSearch, Eye, X, Sparkles, AlertTriangle, Plus } from "lucide-react";
 import { format } from "date-fns";
 
 type InviteStatus = "pending" | "in_progress" | "completed" | "expired" | "shortlisted" | "rejected";
@@ -15,6 +16,9 @@ interface Invite {
   created_at: string;
   expires_at: string;
   token: string;
+  started_at: string | null;
+  from_screening: boolean;
+  own_questions: number;
 }
 
 interface CandidateQuestion {
@@ -48,7 +52,7 @@ const STATUS_LABELS: Record<InviteStatus, string> = {
   pending: "Invited",
   in_progress: "In Progress",
   completed: "Completed",
-  expired: "Expired",
+  expired: "Cancelled / expired",
   shortlisted: "Shortlisted",
   rejected: "Rejected",
 };
@@ -65,6 +69,13 @@ export default function InvitePage() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [jobMode, setJobMode] = useState<string | null>(null);
   const [resumeFile, setResumeFile] = useState<File | null>(null);
+  // Rule shared with CV screening: an interview needs at least one question
+  // (the job's common questions + this candidate's own questions).
+  const [commonCount, setCommonCount] = useState<number | null>(null);
+  const [ownQuestions, setOwnQuestions] = useState<string[]>([]);
+  const [ownDraft, setOwnDraft] = useState("");
+  const [questionOrder, setQuestionOrder] = useState<"own_first" | "common_first">("own_first");
+  const [cancelling, setCancelling] = useState<string | null>(null);
 
   // Candidate questions preview modal
   const [previewInvite, setPreviewInvite] = useState<Invite | null>(null);
@@ -91,6 +102,10 @@ export default function InvitePage() {
       .then((r) => r.ok ? r.json() : null)
       .then((data) => { if (data) setJobMode(data.question_mode ?? null); })
       .catch(() => {});
+    fetch(`/api/jobs/${jobId}/questions`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((rows: { session_id: string | null }[] | null) => { if (rows) setCommonCount(rows.filter((q) => !q.session_id).length); })
+      .catch(() => {});
   }, [loadInvites, jobId]);
 
   async function handleSend(e: React.FormEvent<HTMLFormElement>) {
@@ -110,12 +125,14 @@ export default function InvitePage() {
       fd.append("candidate_name", candidateName);
       fd.append("candidate_email", candidateEmail);
       fd.append("resume", resumeFile);
+      fd.append("questions", JSON.stringify(ownQuestions));
+      fd.append("question_order", questionOrder);
       res = await fetch(`/api/jobs/${jobId}/invites`, { method: "POST", body: fd });
     } else {
       res = await fetch(`/api/jobs/${jobId}/invites`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ candidate_name: candidateName, candidate_email: candidateEmail }),
+        body: JSON.stringify({ candidate_name: candidateName, candidate_email: candidateEmail, questions: ownQuestions, question_order: questionOrder }),
       });
     }
     try {
@@ -125,6 +142,7 @@ export default function InvitePage() {
         setSendSuccess(`Invite sent to ${candidateEmail}`);
         (e.target as HTMLFormElement).reset();
         setResumeFile(null);
+        setOwnQuestions([]);
         await loadInvites();
       } else if (res.status === 207) {
         // Email failed, but session was created — show link
@@ -133,6 +151,7 @@ export default function InvitePage() {
         );
         (e.target as HTMLFormElement).reset();
         setResumeFile(null);
+        setOwnQuestions([]);
         await loadInvites();
       } else {
         setSendError(data.error ?? "Failed to send invite");
@@ -143,6 +162,25 @@ export default function InvitePage() {
       setSending(false);
     }
   }
+
+  function addOwnQuestion() {
+    const t = ownDraft.replace(/\s+/g, " ").trim();
+    if (t.length < 5 || ownQuestions.length >= 8 || ownQuestions.some((q) => q.toLowerCase() === t.toLowerCase())) return;
+    setOwnQuestions([...ownQuestions, t.slice(0, 500)]);
+    setOwnDraft("");
+  }
+
+  async function cancelInvite(invite: Invite) {
+    if (!confirm(`Cancel the interview invite for ${invite.candidate_name ?? invite.candidate_email}? Their link will stop working.`)) return;
+    setCancelling(invite.id);
+    const res = await fetch(`/api/jobs/${jobId}/invites/${invite.id}/cancel`, { method: "POST" });
+    if (!res.ok) alert((await res.json().catch(() => ({}))).error ?? "Couldn't cancel");
+    setCancelling(null);
+    await loadInvites();
+  }
+
+  const generatesFromCv = jobMode === "resume" && !!resumeFile;
+  const noQuestions = commonCount === 0 && ownQuestions.length === 0 && !generatesFromCv;
 
   async function openPreview(invite: Invite) {
     setPreviewInvite(invite);
@@ -203,6 +241,60 @@ export default function InvitePage() {
             </div>
           </div>
 
+          {commonCount === 0 && (
+            <div className="flex items-start gap-2 rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-900 ring-1 ring-amber-200">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <p>
+                This job has no common interview questions yet, so the candidate would be asked nothing.
+                Add questions for this candidate below, or{" "}
+                <Link href={`/dashboard/jobs/${jobId}/questions`} className="font-semibold underline">add common questions</Link> for everyone.
+                {" "}For screened candidates, invite from <Link href={`/dashboard/jobs/${jobId}/screening`} className="font-semibold underline">Candidates</Link> to use their CV-based questions.
+              </p>
+            </div>
+          )}
+
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-gray-600">
+              Questions for this candidate {commonCount === 0 && !generatesFromCv ? <span className="text-red-500">*</span> : <span className="font-normal text-gray-400">(optional — asked before the {commonCount ?? 0} common question{commonCount === 1 ? "" : "s"})</span>}
+            </label>
+            {ownQuestions.length > 0 && (
+              <ol className="mb-2 space-y-1">
+                {ownQuestions.map((q, i) => (
+                  <li key={i} className="flex items-start gap-2 rounded-md bg-gray-50 px-3 py-1.5 text-sm text-gray-800">
+                    <span className="text-xs font-semibold text-gray-400">{i + 1}</span>
+                    <span className="flex-1">{q}</span>
+                    <button type="button" onClick={() => setOwnQuestions(ownQuestions.filter((_, j) => j !== i))} aria-label={`Remove question ${i + 1}`} className="text-gray-400 hover:text-red-600"><X className="h-4 w-4" /></button>
+                  </li>
+                ))}
+              </ol>
+            )}
+            <div className="flex gap-2">
+              <input
+                value={ownDraft}
+                onChange={(e) => setOwnDraft(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addOwnQuestion(); } }}
+                maxLength={500}
+                disabled={ownQuestions.length >= 8}
+                placeholder="Type a question for this candidate and press Enter"
+                className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+              <button type="button" onClick={addOwnQuestion} disabled={ownDraft.trim().length < 5} className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-3 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50">
+                <Plus className="h-4 w-4" /> Add
+              </button>
+            </div>
+            {(commonCount ?? 0) > 0 && (ownQuestions.length > 0 || generatesFromCv) && (
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-gray-600">
+                <span>Ask first:</span>
+                {([["own_first", "This candidate's questions"], ["common_first", "Common questions"]] as const).map(([k, label]) => (
+                  <label key={k} className="flex items-center gap-1.5">
+                    <input type="radio" name="question_order" checked={questionOrder === k} onChange={() => setQuestionOrder(k)} />
+                    {label}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* CV upload — only for resume mode */}
           {jobMode === "resume" && (
             <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4">
@@ -215,7 +307,7 @@ export default function InvitePage() {
               </p>
               <input
                 type="file"
-                accept=".pdf"
+                accept=".pdf,.docx"
                 onChange={(e) => setResumeFile(e.target.files?.[0] ?? null)}
                 className="w-full text-sm text-gray-600 file:mr-3 file:rounded-md file:border-0 file:bg-emerald-600 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-emerald-700"
               />
@@ -235,9 +327,10 @@ export default function InvitePage() {
           )}
 
           <div className="flex justify-end">
+            {noQuestions && <span className="mr-3 self-center text-xs text-amber-700">Add at least one question to send this invite.</span>}
             <button
               type="submit"
-              disabled={sending}
+              disabled={sending || noQuestions}
               className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-5 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-60"
             >
               {sending ? (
@@ -288,6 +381,7 @@ export default function InvitePage() {
                       <p className="text-xs text-gray-500">
                         {invite.candidate_email}
                       </p>
+                      {invite.from_screening && <p className="text-[11px] font-medium text-violet-600">From CV screening</p>}
                     </td>
                     <td className="px-4 py-3">
                       <span
@@ -313,6 +407,16 @@ export default function InvitePage() {
                       </button>
                     </td>
                     <td className="px-4 py-3">
+                      {invite.status === "pending" && !invite.started_at && (
+                        <button
+                          onClick={() => cancelInvite(invite)}
+                          disabled={cancelling === invite.id}
+                          className="mr-1 inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
+                          title="Cancel this invite (only before the candidate starts)"
+                        >
+                          <X className="h-3.5 w-3.5" /> Cancel
+                        </button>
+                      )}
                       {["completed", "shortlisted", "rejected", "expired"].includes(invite.status) ? (
                         <span className="inline-flex items-center gap-1.5 rounded px-2 py-1 text-xs font-medium text-gray-400 cursor-default select-none">
                           <X className="h-3.5 w-3.5" />
@@ -376,7 +480,7 @@ export default function InvitePage() {
                 <div className="rounded-lg border border-dashed border-[#e2e4ec] p-8 text-center">
                   <p className="text-sm font-medium text-gray-600">No questions found</p>
                   <p className="mt-1 text-xs text-gray-500">
-                    No questions have been added to this job yet. Go to the Questions tab to add or generate questions.
+                    This interview has no questions.
                   </p>
                 </div>
               ) : (

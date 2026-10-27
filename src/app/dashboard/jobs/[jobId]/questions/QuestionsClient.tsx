@@ -66,12 +66,12 @@ export default function QuestionsClient({ jobId, jobTitle, questionMode, initial
 
   async function handleDelete(qid: string) {
     setDeleting(qid);
-    try { const res = await fetch(`/api/jobs/${jobId}/questions/${qid}`, { method: "DELETE" }); if (res.ok) setQuestions((prev) => prev.filter((q) => q.id !== qid)); }
+    try { const res = await fetch(`/api/jobs/${jobId}/questions/${qid}`, { method: "DELETE" }); if (res.ok) setQuestions((prev) => prev.filter((q) => q.id !== qid)); else alert((await res.json().catch(() => ({}))).error ?? "Couldn't delete the question"); }
     finally { setDeleting(null); }
   }
 
   async function handleRegenerate() {
-    if (!confirm("Delete all AI-generated questions and regenerate? Custom questions are kept.")) return;
+    if (questions.length > 0 && !confirm("Delete all AI-generated questions and regenerate? Custom questions are kept.")) return;
     setRegenerating(true); setRegenError(null);
     try {
       const res = await fetch(`/api/jobs/${jobId}/questions/regenerate`, { method: "POST" });
@@ -149,8 +149,8 @@ export default function QuestionsClient({ jobId, jobTitle, questionMode, initial
               {questionMode !== "custom_only" && questionMode !== "resume" && (
                 <button onClick={handleRegenerate} disabled={regenerating}
                   className="inline-flex items-center gap-1.5 rounded-md border border-blue-300 bg-blue-50 px-3 py-1.5 text-sm font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-60">
-                  {regenerating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-                  Regenerate AI
+                  {regenerating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : questions.length ? <RefreshCw className="h-3.5 w-3.5" /> : <Sparkles className="h-3.5 w-3.5" />}
+                  {questions.length ? "Regenerate AI" : "Generate from JD"}
                 </button>
               )}
               {questionMode !== "resume" && (
@@ -216,7 +216,27 @@ export default function QuestionsClient({ jobId, jobTitle, questionMode, initial
 
           {questions.length === 0 ? (
             <div className="rounded-lg border border-dashed border-gray-300 bg-white p-10 text-center">
-              <p className="text-sm text-gray-500">{questionMode === "resume" ? "Questions are generated per-candidate when you send an invite with their CV." : `Click "Add Question" or "Upload CSV" to build your bank.`}</p>
+              {questionMode === "resume" ? (
+                <p className="text-sm text-gray-500">Questions are generated per-candidate when you send an invite with their CV.</p>
+              ) : (
+                <>
+                  <p className="text-sm font-semibold text-gray-900">No common interview questions yet</p>
+                  <p className="mx-auto mt-1 max-w-md text-sm text-gray-500">
+                    These are asked in every interview for this job. Generate a starter set from the job description, or write your own.
+                  </p>
+                  <div className="mt-4 flex justify-center gap-2">
+                    {questionMode !== "custom_only" && (
+                      <button onClick={handleRegenerate} disabled={regenerating} className="sc-btn-primary !py-2">
+                        {regenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />} Generate from job description
+                      </button>
+                    )}
+                    <button onClick={() => setShowForm(true)} className="sc-btn-secondary !py-2"><PlusCircle className="h-4 w-4" /> Write a question</button>
+                  </div>
+                  <p className="mx-auto mt-4 max-w-md text-xs text-gray-400">
+                    Tip: when you invite a shortlisted candidate from <strong>Candidates</strong>, you can also add personalised questions based on gaps in their CV.
+                  </p>
+                </>
+              )}
             </div>
           ) : (
             <div className="space-y-3">

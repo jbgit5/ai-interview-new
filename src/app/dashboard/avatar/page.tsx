@@ -463,6 +463,36 @@ function NovaPreview({ status }: { status: DemoStatus }) {
   );
 }
 
+// ── Real-person preview (photo) ───────────────────────────────────────────
+function RealPreview({ status }: { status: DemoStatus }) {
+  const isSpeaking = status === "speaking";
+  const isListening = status === "listening";
+  const isThinking = status === "thinking";
+  const ringColor = isSpeaking ? "#3b82f6" : isListening ? "#22c55e" : isThinking ? "#f59e0b" : "#475569";
+  return (
+    <div className="flex flex-col items-center gap-1.5">
+      <div className="relative" style={{ width: 88, height: 88 }}>
+        {status !== "waiting" && <span className="absolute inset-0 rounded-full opacity-30 animate-ping" style={{ border: `2px solid ${ringColor}` }} />}
+        <div className="absolute rounded-full" style={{ inset: -2, background: `conic-gradient(from 0deg,${ringColor},#8b5cf6,${ringColor})`, borderRadius:"50%", animation: status !== "waiting" ? "spin 3s linear infinite" : "none" }} />
+        <div className="absolute rounded-full" style={{ inset: 2, background: "#0f172a", zIndex:1, borderRadius:"50%" }} />
+        <div
+          className="absolute overflow-hidden rounded-full"
+          style={{
+            inset: 3,
+            zIndex: 2,
+            backgroundImage: "url(/avatars/maya-real.webp)",
+            backgroundSize: "auto 118%",
+            backgroundPosition: "50% 18%",
+            backgroundRepeat: "no-repeat",
+          }}
+        />
+      </div>
+      <p className="text-[11px] font-semibold text-white">Maya (real)</p>
+      <p className="text-[10px]" style={{ color: ringColor }}>{isSpeaking ? "Speaking…" : isListening ? "Listening…" : isThinking ? "Thinking…" : "Waiting"}</p>
+    </div>
+  );
+}
+
 const AVATARS: AvatarOption[] = [
   {
     id: "maya",
@@ -520,6 +550,13 @@ const AVATARS: AvatarOption[] = [
     accent: "ring-purple-500",
     preview: null,
   },
+  {
+    id: "real",
+    name: "Maya (real)",
+    description: "Real-person photo. Lip-synced video when GPT-Live voice + Simli are enabled; otherwise a still photo",
+    accent: "ring-blue-500",
+    preview: null,
+  },
 ];
 
 const DEMO_STATUSES: DemoStatus[] = ["waiting", "speaking", "listening", "thinking"];
@@ -574,6 +611,7 @@ export default function AvatarPage() {
       case "zara":   return <ZaraPreview   status={status} />;
       case "chen":   return <ChenPreview   status={status} />;
       case "nova":   return <NovaPreview   status={status} />;
+      case "real":   return <RealPreview   status={status} />;
       default:       return <MayaPreview   status={status} />;
     }
   }
@@ -606,7 +644,7 @@ export default function AvatarPage() {
         </div>
 
         {/* Avatar grid */}
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-8">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-5">
           {AVATARS.map((av) => {
             const isSelected = selectedId === av.id;
             return (

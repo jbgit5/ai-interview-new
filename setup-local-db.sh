@@ -59,7 +59,17 @@ for file in \
   "db/migrations/009_proctor_event_types.sql" \
   "db/migrations/010_telemetry.sql" \
   "db/migrations/011_interviewer_avatar.sql" \
-  "db/migrations/012_allow_probes.sql"
+  "db/migrations/012_allow_probes.sql" \
+  "db/migrations/013_live_voice_sessions.sql" \
+  "db/migrations/014_job_live_voice_flag.sql" \
+  "db/migrations/015_avatar_sessions.sql" \
+  "db/migrations/016_recruiter_debug_mode.sql" \
+  "db/migrations/017_proctor_snapshots.sql" \
+  "db/migrations/018_proctor_multiple_monitors.sql" \
+  "db/migrations/019_cv_screening.sql" \
+  "db/migrations/020_interview_plan.sql" \
+  "db/migrations/021_question_order.sql" \
+  "db/migrations/022_screening_checks.sql"
 do
   echo "- Running $file"
   docker exec -i "$CONTAINER_NAME" psql \

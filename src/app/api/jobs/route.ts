@@ -3,6 +3,8 @@ import { auth } from "@/lib/auth";
 import { pool } from "@/lib/db";
 import OpenAI from "openai";
 import { buildQuestionGenerationPrompt, type GeneratedQuestion } from "@/lib/prompts";
+import { CriteriaSchema } from "@/lib/screening/criteria";
+import { createConfigVersion } from "@/lib/screening/service";
 
 export async function GET(request: NextRequest) {
   const session = await auth.api.getSession({ headers: request.headers });
@@ -56,6 +58,8 @@ export async function POST(request: NextRequest) {
     status = "draft",
     question_mode = "ai_only",
     allow_probes,
+    criteria,
+    generate_questions,
   } = body;
 
   if (!title?.trim()) {
@@ -71,6 +75,22 @@ export async function POST(request: NextRequest) {
   if (!validModes.includes(question_mode)) {
     return NextResponse.json({ error: "Invalid question_mode" }, { status: 400 });
   }
+
+  // Screening requirements reviewed on the create-job screen (optional). Saved as version 1.
+  let parsedCriteria = null;
+  if (criteria !== undefined && criteria !== null) {
+    const parsed = CriteriaSchema.safeParse(criteria);
+    if (!parsed.success) {
+      return NextResponse.json(
+        { error: "Invalid requirements", issues: parsed.error.issues.slice(0, 10).map((i) => ({ path: i.path.join("."), message: i.message })) },
+        { status: 400 }
+      );
+    }
+    parsedCriteria = parsed.data;
+  }
+  // Questions are created later on the Interview questions tab. Legacy callers that don't send
+  // generate_questions keep the old behaviour (auto-generate for ai_only/mixed).
+  const shouldGenerate = typeof generate_questions === "boolean" ? generate_questions : true;
 
   // Default true if omitted — preserves legacy behavior (probes enabled).
   const allowProbes = typeof allow_probes === "boolean" ? allow_probes : true;
@@ -92,8 +112,17 @@ export async function POST(request: NextRequest) {
 
   const job = result.rows[0];
 
+  if (parsedCriteria) {
+    try {
+      await createConfigVersion(pool, job.id, recruiter.rows[0].id, parsedCriteria);
+    } catch (err) {
+      // Non-fatal — requirements can be saved again from the Requirements tab.
+      console.error("[jobs] saving screening requirements failed:", (err as { code?: string })?.code);
+    }
+  }
+
   // Auto-generate AI questions for ai_only and mixed modes only
-  if ((question_mode === "ai_only" || question_mode === "mixed") && description?.trim()) {
+  if (shouldGenerate && (question_mode === "ai_only" || question_mode === "mixed") && description?.trim()) {
     try {
       const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       const aiRes = await openai.chat.completions.create({

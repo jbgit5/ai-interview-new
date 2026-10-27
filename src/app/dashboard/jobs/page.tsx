@@ -139,10 +139,10 @@ export default async function JobsPage() {
                       Questions
                     </Link>
                     <Link
-                      href={`/dashboard/jobs/${job.id}/invite`}
+                      href={`/dashboard/jobs/${job.id}/screening`}
                       className="sc-btn-primary flex-1 justify-center !py-1.5 !text-xs"
                     >
-                      Invite
+                      Candidates
                       <ArrowRight className="h-3.5 w-3.5" />
                     </Link>
                   </div>

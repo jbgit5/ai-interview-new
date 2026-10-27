@@ -15,11 +15,20 @@ import {
   Shield,
   AlertTriangle,
   X,
+  Captions,
+  CaptionsOff,
+  PhoneOff,
+  ShieldCheck,
+  Check,
 } from "lucide-react";
 import { useLiveKit } from "@/hooks/useLiveKit";
 import { useSessionTelemetry } from "@/hooks/useSessionTelemetry";
 import { useVideoRecorder } from "@/hooks/useVideoRecorder";
+import { useCameraHealth } from "@/hooks/useCameraHealth";
 import { useInterview } from "@/hooks/useInterview";
+import { useLiveInterview } from "@/hooks/useLiveInterview";
+import { usePipelineInterview } from "@/hooks/usePipelineInterview";
+import { describeLiveFallback } from "@/lib/live/fallbackReason";
 import type {
   AIStatus,
   CandidateListeningPhase,
@@ -78,6 +87,42 @@ export default function InterviewRoomPage() {
   );
 
   // ─── AI Interview engine ─────────────────────────────────────────────────
+  // Three interchangeable engines with the same shape:
+  //   pipeline — DEFAULT. Deepgram STT → our brain → Deepgram Aura voice, short measured waits,
+  //              instant ack, late-speech merge (src/hooks/usePipelineInterview.ts).
+  //   legacy   — the original engine (fixed 7.2 s silence window). `?engine=legacy`.
+  //   live     — GPT-Live experiment. `?engine=live` AND the job/server allow it; falls back to
+  //              the pipeline if it cannot start.
+  // Proctoring + recording are engine-independent.
+  const micTrackRef = useRef<MediaStreamTrack | null>(null);
+  const [liveEligible, setLiveEligible] = useState(false);
+  const [liveActive, setLiveActive] = useState(false);
+  const [engineChoice, setEngineChoice] = useState<"pipeline" | "legacy" | "live">("pipeline");
+  // Why we're (not) on GPT-Live — surfaced in the debug header, because the live hook's own logs vanish
+  // the moment the room falls back to another engine.
+  const [fallbackReason, setFallbackReason] = useState<string | null>(null);
+  const [forcedLegacy, setForcedLegacy] = useState(false);
+  // Recruiter's Settings → Debug mode (from /start). Off = clean Meet-style room for candidates.
+  const [debugMode, setDebugMode] = useState(false);
+  const [captionsOn, setCaptionsOn] = useState(true);
+
+  const legacyEngine = useInterview({ sessionToken: params.token, telemetry: sessionTelemetry });
+  const legacyStartInterview = legacyEngine.startInterview;
+  const pipelineEngine = usePipelineInterview({ sessionToken: params.token, telemetry: sessionTelemetry });
+  const pipelineStartInterview = pipelineEngine.startInterview;
+  const liveEngine = useLiveInterview({
+    sessionToken: params.token,
+    telemetry: sessionTelemetry,
+    getMicTrack: () => micTrackRef.current,
+    onFallback: (reason) => {
+      setFallbackReason(reason);
+      setLiveActive(false);
+      setEngineChoice("pipeline");
+      void pipelineStartInterview();
+    },
+  });
+
+  const engine = liveActive ? liveEngine : engineChoice === "legacy" ? legacyEngine : pipelineEngine;
   const {
     state: interviewState,
     aiStatus,
@@ -88,17 +133,85 @@ export default function InterviewRoomPage() {
     turns,
     turnIndex,
     logs,
-    startInterview,
     endEarly,
-    reset: resetInterview,
-  } = useInterview({ sessionToken: params.token, telemetry: sessionTelemetry });
+  } = engine;
+  const liveStartInterview = liveEngine.startInterview;
+  const startInterview = useCallback(() => {
+    // Start the voice engine FIRST (the standard engine must unlock audio synchronously inside this
+    // click), then ask for fullscreen (also needs the click; skipped in debug mode). Best-effort: a
+    // refusal never blocks the interview; leaving fullscreen later is recorded and a button appears.
+    let started: Promise<void>;
+    if (engineChoice === "live") {
+      setLiveActive(true);
+      started = liveStartInterview();
+    } else if (engineChoice === "legacy") {
+      started = legacyStartInterview();
+    } else {
+      started = pipelineStartInterview();
+    }
+    if (!debugMode && !document.fullscreenElement) {
+      document.documentElement.requestFullscreen?.().catch(() => {});
+    }
+    return started;
+  }, [debugMode, engineChoice, liveStartInterview, legacyStartInterview, pipelineStartInterview]);
+  // "Done answering": ends the candidate's answer immediately (pipeline engine only). The silence rule is
+  // just the fallback — silence alone can't tell "finished" from "thinking".
+  const pipelineActive = engineChoice === "pipeline" && !liveActive;
+  const finishAnswer = pipelineEngine.finishAnswer;
+  const canFinishAnswer =
+    pipelineActive && interviewState === "listening" && transcript.trim().length > 0;
+  useEffect(() => {
+    if (!pipelineActive) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== "Space" || e.repeat) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "BUTTON" || t.isContentEditable)) return;
+      if (finishAnswer()) e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pipelineActive, finishAnswer]);
+
+  // Lip-sync avatar ↔ Maya's voice: mute the raw voice only while the avatar is rendering it.
+  // The avatar runs on the pipeline (default) and GPT-Live engines; the legacy engine has no voice track.
+  const avatarEngine = liveActive ? liveEngine : pipelineEngine;
+  const avatarAvailable = liveActive || engineChoice === "pipeline";
+  const setLivePlaybackMuted = avatarEngine.setPlaybackMuted;
+  const setAvatarSpeaking = avatarEngine.setAvatarSpeaking;
+  const getAudioDebug = avatarEngine.getAudioDebug;
+  const onAvatarTelemetry = useCallback(
+    (eventName: string, attrs?: Record<string, unknown>) => {
+      sessionTelemetry.enqueue({ event_name: eventName, attrs });
+    },
+    [sessionTelemetry]
+  );
+  const legacyReset = legacyEngine.reset;
+  const liveReset = liveEngine.reset;
+  const pipelineReset = pipelineEngine.reset;
+  const resetInterview = useCallback(() => {
+    legacyReset();
+    liveReset();
+    pipelineReset();
+  }, [legacyReset, liveReset, pipelineReset]);
 
   // ─── Proctoring ──────────────────────────────────────────────────────────
-  const { integrityScore, violations, activeWarning, dismissWarning, focusStatus } = useProctor({
+  const { integrityScore, violations, activeWarning, dismissWarning, focusStatus, aiStatus: proctorAiStatus } = useProctor({
     sessionToken: params.token,
     videoRef,
     enabled: interviewState !== "idle" && interviewState !== "completed",
+    // Download the AI models while the candidate is on the "Ready?" screen, not mid-interview.
+    aiPreload: phase === "ready",
+    onTelemetry: onAvatarTelemetry,
   });
+
+  // Fullscreen state (proctoring): a "Return to full screen" button appears if the candidate leaves it.
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    onChange();
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
 
   // ─── Cleanup on unmount (back button, navigation, tab close) ────────────
   useEffect(() => {
@@ -141,6 +254,14 @@ export default function InterviewRoomPage() {
         const startData = await startRes.json();
         if (cancelled) return;
         setSessionId(startData.session_id);
+        // `?engine=legacy` / `?engine=live` are per-link switches for A/B comparison and support.
+        const engineParam = new URLSearchParams(window.location.search).get("engine");
+        const forceLegacy = engineParam === "legacy";
+        const liveOk = startData.live_voice_eligible === true && engineParam === "live";
+        setLiveEligible(liveOk);
+        setForcedLegacy(forceLegacy);
+        setEngineChoice(forceLegacy ? "legacy" : liveOk ? "live" : "pipeline");
+        setDebugMode(startData.debug_mode === true);
         if (typeof startData.interviewer_avatar_id === "string") {
           setServerInterviewerAvatar(
             normalizeInterviewerAvatarId(startData.interviewer_avatar_id)
@@ -199,12 +320,15 @@ export default function InterviewRoomPage() {
   }, [params.token]);
 
   // ─── Step 2: LiveKit ─────────────────────────────────────────────────────
-  const { connectionState, localVideoTrack, localAudioTrack, isConnected, isReconnecting, error: livekitError, disconnect } =
+  const { connectionState, localVideoTrack, localAudioTrack, isConnected, isReconnecting, error: livekitError, disconnect, mediaVersion } =
     useLiveKit({
       url: livekitUrl,
       token: livekitToken ?? "",
       onTelemetry: onLiveKitTelemetry,
     });
+
+  // Share LiveKit's mic track with the live voice engine (no second mic prompt).
+  micTrackRef.current = localAudioTrack?.mediaStreamTrack ?? null;
 
   // Handle LiveKit errors
   useEffect(() => {
@@ -221,6 +345,13 @@ export default function InterviewRoomPage() {
     }
   }, [isConnected, phase]);
 
+  // While the candidate reads the "Ready?" screen: connect speech recognition (muted, nothing billed)
+  // and download Maya's short clips, so clicking Start only waits for her opening line.
+  const pipelinePrewarm = pipelineEngine.prewarm;
+  useEffect(() => {
+    if (phase === "ready" && engineChoice === "pipeline" && interviewState === "idle") pipelinePrewarm();
+  }, [phase, engineChoice, interviewState, pipelinePrewarm]);
+
   // Interview clock starts only after the candidate clicks "Start Interview" (intro),
   // not when the room / LiveKit connects.
   useEffect(() => {
@@ -236,12 +367,15 @@ export default function InterviewRoomPage() {
   }, [interviewState]);
 
   // ─── Step 3: Attach local video to <video> element ────────────────────────
+  // Also re-runs when the room screen appears (phase): if the camera track arrived while the
+  // loading screen was still showing, there was no <video> to attach to and the tile stayed empty.
+  // And after a camera swap (mediaVersion — see useLiveKit), so the self-view shows the new camera.
   useEffect(() => {
     if (!localVideoTrack || !videoRef.current) return;
     const el = videoRef.current;
     localVideoTrack.attach(el);
     return () => { localVideoTrack.detach(el); };
-  }, [localVideoTrack]);
+  }, [localVideoTrack, phase, mediaVersion]);
 
   // ─── Step 4: Video recording ─────────────────────────────────────────────
   const { isRecording, chunksUploaded } = useVideoRecorder({
@@ -254,6 +388,17 @@ export default function InterviewRoomPage() {
       interviewState !== "idle" &&
       interviewState !== "completed" &&
       interviewState !== "error",
+    onTelemetry: onAvatarTelemetry,
+    mediaVersion,
+  });
+
+  // Self-view health: records freezes / blank tile / camera ending, and re-binds the camera once.
+  useCameraHealth({
+    videoRef,
+    videoTrack: localVideoTrack,
+    enabled: isConnected && interviewState !== "idle" && interviewState !== "completed",
+    onTelemetry: onAvatarTelemetry,
+    mediaVersion,
   });
 
   // ─── Elapsed timer (only while interview is active) ───────────────────────
@@ -310,6 +455,8 @@ export default function InterviewRoomPage() {
 
   useEffect(() => {
     if (interviewState === "completed") {
+      // Proctoring is already off here, so leaving fullscreen is not recorded as a violation.
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
       disconnect();
       // Stop all active media tracks so camera/mic light turns off immediately
       navigator.mediaDevices.enumerateDevices().catch(() => {});
@@ -321,7 +468,7 @@ export default function InterviewRoomPage() {
         const media = el as HTMLVideoElement | HTMLAudioElement;
         try { media.srcObject = null; } catch { /* ignore */ }
       });
-      setCloseCountdown(5);
+      setCloseCountdown(3);
     }
   }, [interviewState, disconnect, localVideoTrack, localAudioTrack]);
 
@@ -382,8 +529,28 @@ export default function InterviewRoomPage() {
     );
   }
 
+  // ─── Meet-style room ──────────────────────────────────────────────────────
+  // Candidates see two video tiles (Maya + themselves), optional captions and a control bar —
+  // like a real video interview. Developer panels (debug logs, engine, transcript, integrity score)
+  // appear only when the recruiter turned on Settings → Debug mode.
+  const started = interviewState !== "idle";
+  const mayaSpeaking = aiStatus === "speaking";
+  const youSpeaking = interviewState === "listening" && candidateListeningPhase === "speaking";
+  const captionLine =
+    interviewState === "listening" && transcript
+      ? { who: "You", text: transcript }
+      : currentQuestion
+        ? { who: "Maya", text: currentQuestion }
+        : null;
+
   return (
-    <div className="fixed inset-0 flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-gray-950 text-white">
+    <div
+      className="fixed inset-0 flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-[#202124] text-white"
+      // Read by the end-to-end browser test (tests/e2e) to follow the interview without scraping text.
+      data-interview-state={interviewState}
+      data-ai-status={aiStatus}
+      data-engine={liveActive ? "live" : engineChoice}
+    >
       {/* Reconnecting banner */}
       {isReconnecting && (
         <div className="flex items-center justify-center gap-2 bg-amber-500 px-4 py-2 text-sm font-medium text-white">
@@ -392,7 +559,7 @@ export default function InterviewRoomPage() {
         </div>
       )}
 
-      {/* ─── Proctoring warning overlay ────────────────────────────────── */}
+      {/* ─── Proctoring warning (candidates always see these) ─────────── */}
       {activeWarning && (
         <div className={`fixed top-4 left-1/2 z-50 -translate-x-1/2 flex items-start gap-3 rounded-2xl px-5 py-4 shadow-2xl w-full max-w-md border-2 ${
           activeWarning.severity === "high"
@@ -412,282 +579,306 @@ export default function InterviewRoomPage() {
           </div>
           <div className="flex-1 min-w-0">
             <p className="text-sm font-bold tracking-wide">
-              {activeWarning.severity === "high" ? "🚨 Integrity Violation" :
-               activeWarning.severity === "medium" ? "⚠️ Warning" : "Notice"}
+              {activeWarning.severity === "high" ? "Integrity warning" :
+               activeWarning.severity === "medium" ? "Warning" : "Notice"}
             </p>
             <p className="text-sm mt-0.5 opacity-90">{activeWarning.message}</p>
-            <p className="text-xs mt-1.5 opacity-60">This event has been recorded and flagged for recruiter review.</p>
+            <p className="text-xs mt-1.5 opacity-60">This event has been recorded for the recruiter&apos;s review.</p>
           </div>
-          <button onClick={dismissWarning} className="shrink-0 opacity-50 hover:opacity-100 mt-0.5">
+          <button onClick={dismissWarning} className="shrink-0 opacity-50 hover:opacity-100 mt-0.5" aria-label="Dismiss">
             <X className="h-4 w-4" />
           </button>
         </div>
       )}
 
-      {/* Main area — min-h-0 lets flex children shrink so the bottom bar never gets pushed off-screen */}
+      {/* Main area */}
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {/* Video feed */}
-        <div className="relative flex min-h-0 min-w-0 flex-1 bg-black">
-          <video
-            ref={videoRef}
-            autoPlay
-            muted
-            playsInline
-            className={`h-full w-full object-cover transition-opacity ${camOff ? "opacity-0" : "opacity-100"}`}
-            style={{ transform: "scaleX(-1)" }}
-          />
+        {/* Stage: two tiles, side by side (stacked on narrow screens) */}
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+          <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-2 gap-3 p-3 md:grid-cols-2 md:grid-rows-1">
+            <Tile name="Maya · AI Interviewer" speaking={mayaSpeaking}>
+              {serverInterviewerAvatar ? (
+                <MayaAvatar
+                  status={aiStatus}
+                  size="md"
+                  variant="tile"
+                  serverAvatarId={serverInterviewerAvatar}
+                  simli={{
+                    interviewToken: params.token,
+                    audioTrack: avatarEngine.remoteAudioTrack,
+                    // Lip-sync runs on the pipeline (default) and GPT-Live engines. It starts at the Start
+                    // click (not when Maya's audio arrives), so her live face is ready by her first word.
+                    // On completion this whole screen is replaced, which unmounts the avatar and stops Simli.
+                    enabled: avatarAvailable && started && interviewState !== "error",
+                    interviewStarted: started,
+                    onActiveChange: setLivePlaybackMuted,
+                    onTelemetry: onAvatarTelemetry,
+                    onSpeakingChange: setAvatarSpeaking,
+                    getDebugContext: getAudioDebug,
+                  }}
+                />
+              ) : (
+                // Saved avatar not known until /start answers — never flash a different face meanwhile.
+                <div className="h-full w-full animate-pulse bg-white/5" aria-hidden />
+              )}
+            </Tile>
 
-          {camOff && (
-            <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
-              <div className="flex h-20 w-20 items-center justify-center rounded-full bg-gray-700">
-                <VideoOff className="h-8 w-8 text-gray-400" />
+            <Tile name="You" speaking={youSpeaking} micOff={micMuted}>
+              <video
+                ref={videoRef}
+                autoPlay
+                muted
+                playsInline
+                className={`h-full w-full object-cover transition-opacity ${camOff ? "opacity-0" : "opacity-100"}`}
+                style={{ transform: "scaleX(-1)" }}
+              />
+              {camOff && (
+                <div className="absolute inset-0 flex items-center justify-center bg-[#3c4043]">
+                  <div className="flex h-20 w-20 items-center justify-center rounded-full bg-gray-600">
+                    <VideoOff className="h-8 w-8 text-gray-300" />
+                  </div>
+                </div>
+              )}
+            </Tile>
+          </div>
+
+          {/* Captions */}
+          {captionsOn && started && captionLine && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-5 z-10 flex justify-center px-6">
+              <div className="max-w-3xl rounded-lg bg-black/80 px-4 py-2 text-center text-[15px] leading-snug shadow-lg">
+                <span className="mr-1.5 font-semibold text-[#8ab4f8]">{captionLine.who}:</span>
+                <span className="line-clamp-3">{captionLine.text}</span>
               </div>
             </div>
           )}
 
-          {/* Recording indicator */}
-          {isRecording && (
-            <div className="absolute left-4 top-4 flex items-center gap-1.5 rounded-full bg-black/60 px-3 py-1 text-xs font-medium">
-              <Circle className="h-2.5 w-2.5 fill-red-500 text-red-500" />
-              REC
-            </div>
-          )}
-
-          {/* ── Prominent focus / proctoring status bar ── */}
-          {interviewState !== "idle" && (
-            <div className={`absolute top-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 rounded-full px-4 py-1.5 text-xs font-semibold shadow-lg backdrop-blur-sm transition-all duration-500 ${
-              focusStatus === "tab_hidden"
-                ? "bg-red-600/90 text-white border border-red-400"
-                : focusStatus === "blurred"
-                ? "bg-amber-500/90 text-white border border-amber-300"
-                : "bg-black/50 text-green-400 border border-green-500/40"
-            }`}>
-              <span className={`h-2 w-2 rounded-full ${
-                focusStatus === "tab_hidden" ? "bg-red-200 animate-ping" :
-                focusStatus === "blurred"    ? "bg-amber-200 animate-pulse" :
-                                              "bg-green-400 animate-pulse"
-              }`} />
-              {focusStatus === "tab_hidden"
-                ? "⚠ Tab hidden — return to interview now"
-                : focusStatus === "blurred"
-                ? "⚠ Window not in focus"
-                : "● Being monitored"}
-              <span className="opacity-60">|</span>
-              <Shield className="h-3 w-3" />
-              <span className={
-                integrityScore >= 80 ? "text-green-400" :
-                integrityScore >= 60 ? "text-amber-300" : "text-red-300"
-              }>{integrityScore}</span>
-            </div>
-          )}
-
-          {/* Elapsed time */}
-          {isConnected && (
-            <div className="absolute right-4 top-4 rounded-full bg-black/60 px-3 py-1 text-xs font-mono">
-              {formatTime(elapsedSeconds)}
-            </div>
-          )}
-
-          {/* Live transcript overlay while candidate is speaking */}
-          {interviewState === "listening" && transcript && (
-            <div className="absolute bottom-6 left-1/2 w-3/4 -translate-x-1/2 rounded-xl bg-black/70 px-4 py-3 text-center text-sm text-white backdrop-blur-sm">
-              {transcript}
-            </div>
-          )}
-
-          {/* Start Interview button — shown before interview begins */}
+          {/* Start — shown before the interview begins */}
           {interviewState === "idle" && phase === "ready" && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-black/50">
-              <p className="text-lg font-semibold text-white">
-                Room connected. Ready to begin?
+            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-4 bg-black/60 px-6 text-center">
+              <p className="text-xl font-semibold text-white">Ready to begin your interview?</p>
+              <p className="max-w-md text-sm text-gray-300">
+                Maya, your AI interviewer, will ask a few questions. Take your time to think — when you&apos;ve
+                finished an answer, press <b>Done answering</b> (or Space), or just pause for a moment.
+                This session is recorded and monitored
+                {!debugMode && <> — your screen will switch to full screen when you start</>}.
               </p>
               <button
                 onClick={startInterview}
-                className="flex items-center gap-2 rounded-xl bg-blue-600 px-8 py-3 text-base font-semibold text-white shadow-lg hover:bg-blue-700"
+                className="flex items-center gap-2 rounded-full bg-[#8ab4f8] px-8 py-3 text-base font-semibold text-[#202124] shadow-lg hover:bg-[#aecbfa]"
               >
                 <PlayCircle className="h-5 w-5" />
-                Start Interview
+                Start interview
               </button>
             </div>
           )}
         </div>
 
-        {/* Right panel */}
-        <div className="flex h-full min-h-0 w-80 shrink-0 flex-col overflow-hidden border-l border-white/10 bg-gray-900">
-          {/* Header */}
-          <div className="border-b border-white/10 p-4">
-            <h2 className="text-sm font-semibold text-white">Interview</h2>
-            <p className="mt-0.5 text-xs text-gray-400">
-              Turn {turnIndex} •{" "}
-              <span
-                className={`font-medium ${CONV_PHASE_COLOR_TEXT[conversationTurnPhase]}`}
-                title="Conversation state machine phase (telemetry)"
-              >
-                {CONV_PHASE_LABEL[conversationTurnPhase]}
-              </span>
-              {" "}
-              •{" "}
-              <span className={`font-medium ${AI_STATUS_COLOR_TEXT[aiStatus]}`}>
-                {AI_STATUS_LABEL[aiStatus]}
-              </span>
-              {interviewState === "listening" && (
-                <>
-                  {" "}
-                  •{" "}
-                  <span
-                    className={`font-medium ${CANDIDATE_PHASE_COLOR_TEXT[candidateListeningPhase]}`}
-                  >
-                    You: {CANDIDATE_PHASE_LABEL[candidateListeningPhase]}
-                  </span>
-                </>
-              )}
-            </p>
-          </div>
-
-          {/* Maya AI Avatar */}
-          <div className="flex items-center justify-center border-b border-white/10 py-5">
-            <MayaAvatar
-              status={aiStatus}
-              size="md"
-              serverAvatarId={serverInterviewerAvatar}
-            />
-          </div>
-
-          {/* Current question — capped height so long intros don’t steal layout from transcript + footer */}
-          {currentQuestion && (
-            <div className="max-h-[min(38vh,320px)] shrink-0 overflow-y-auto border-b border-white/10 bg-blue-600/10 px-4 py-3">
-              <p className="mb-1 text-xs font-medium uppercase tracking-wide text-blue-400">
-                Current Question
-              </p>
-              <p className="text-sm leading-relaxed text-white">
-                {currentQuestion}
+        {/* ─── Debug side panel (Settings → Debug mode only) ─────────────── */}
+        {debugMode && (
+          <div className="flex h-full min-h-0 w-80 shrink-0 flex-col overflow-hidden border-l border-white/10 bg-gray-900">
+            <div className="shrink-0 border-b border-white/10 p-4">
+              <h2 className="text-sm font-semibold text-white">Debug · Interview</h2>
+              <p className="mt-0.5 text-xs text-gray-400">
+                Turn {turnIndex} •{" "}
+                <span className={`font-medium ${CONV_PHASE_COLOR_TEXT[conversationTurnPhase]}`}>
+                  {CONV_PHASE_LABEL[conversationTurnPhase]}
+                </span>{" "}
+                •{" "}
+                <span className={`font-medium ${AI_STATUS_COLOR_TEXT[aiStatus]}`}>{AI_STATUS_LABEL[aiStatus]}</span>
+                {interviewState === "listening" && (
+                  <>
+                    {" "}•{" "}
+                    <span className={`font-medium ${CANDIDATE_PHASE_COLOR_TEXT[candidateListeningPhase]}`}>
+                      You: {CANDIDATE_PHASE_LABEL[candidateListeningPhase]}
+                    </span>
+                  </>
+                )}
               </p>
             </div>
-          )}
 
-          {/* Conversation transcript */}
-          <div className="min-h-0 flex-1 overflow-y-auto p-3 space-y-2">
-            {turns.length === 0 && (
-              <p className="py-4 text-center text-xs text-gray-500">
-                Conversation will appear here
-              </p>
-            )}
-            {turns.map((turn, i) => (
-              <div
-                key={i}
-                className={`rounded-lg px-3 py-2 text-xs leading-relaxed ${
-                  turn.role === "interviewer"
-                    ? "bg-gray-800 text-gray-200"
-                    : "ml-2 bg-blue-600/20 text-blue-100"
-                }`}
-              >
-                <span
-                  className={`mb-0.5 block text-[10px] font-semibold uppercase tracking-wide ${
-                    turn.role === "interviewer" ? "text-gray-400" : "text-blue-400"
-                  }`}
-                >
-                  {turn.role === "interviewer" ? "AI Interviewer" : "You"}
-                </span>
-                {turn.content}
-              </div>
-            ))}
-            <div ref={transcriptEndRef} />
-          </div>
-
-          {/* Footer — connection + integrity */}
-          <div className="border-t border-white/10 p-3 space-y-2">
-            {/* Live focus status */}
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] uppercase tracking-wide text-gray-500 font-semibold">Focus</span>
-              <span className={`inline-flex items-center gap-1 text-[10px] font-semibold rounded-full px-2 py-0.5 ${
-                focusStatus === "focused"    ? "bg-green-900/60 text-green-400" :
-                focusStatus === "blurred"   ? "bg-amber-900/60 text-amber-400" :
-                                              "bg-red-900/60 text-red-400"
-              }`}>
-                <span className={`h-1.5 w-1.5 rounded-full ${
-                  focusStatus === "focused"    ? "bg-green-400 animate-pulse" :
-                  focusStatus === "blurred"   ? "bg-amber-400" :
-                                                "bg-red-400"
-                }`} />
-                {focusStatus === "focused"    ? "On screen" :
-                 focusStatus === "blurred"   ? "Window unfocused" :
-                                               "Tab hidden"}
-              </span>
-            </div>
-
-            {/* Integrity score */}
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <div className="flex items-center gap-1 text-xs text-gray-400">
-                  <Shield className="h-3 w-3" />
-                  Integrity Score
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {currentQuestion && (
+                <div className="sticky top-0 z-10 bg-gray-900">
+                  <div className="max-h-[32vh] overflow-y-auto border-b border-white/10 bg-blue-600/10 px-4 py-3">
+                    <p className="mb-1 text-xs font-medium uppercase tracking-wide text-blue-400">Current Question</p>
+                    <p className="text-sm leading-relaxed text-white">{currentQuestion}</p>
+                  </div>
                 </div>
-                <span className={`text-xs font-bold ${
-                  integrityScore >= 80 ? "text-green-400" :
-                  integrityScore >= 60 ? "text-amber-400" : "text-red-400"
-                }`}>{integrityScore}/100</span>
-              </div>
-              <div className="h-1.5 w-full rounded-full bg-gray-700">
-                <div
-                  className={`h-1.5 rounded-full transition-all duration-500 ${
-                    integrityScore >= 80 ? "bg-green-500" :
-                    integrityScore >= 60 ? "bg-amber-500" : "bg-red-500"
-                  }`}
-                  style={{ width: `${integrityScore}%` }}
-                />
-              </div>
-              {violations.length > 0 && (
-                <p className="mt-1 text-[10px] text-gray-500">{violations.length} event{violations.length !== 1 ? "s" : ""} recorded</p>
               )}
+              <div className="space-y-2 p-3">
+                {turns.length === 0 && (
+                  <p className="py-4 text-center text-xs text-gray-500">Conversation will appear here</p>
+                )}
+                {turns.map((turn, i) => (
+                  <div
+                    key={i}
+                    className={`rounded-lg px-3 py-2 text-xs leading-relaxed ${
+                      turn.role === "interviewer" ? "bg-gray-800 text-gray-200" : "ml-2 bg-blue-600/20 text-blue-100"
+                    }`}
+                  >
+                    <span className={`mb-0.5 block text-[10px] font-semibold uppercase tracking-wide ${
+                      turn.role === "interviewer" ? "text-gray-400" : "text-blue-400"
+                    }`}>
+                      {turn.role === "interviewer" ? "AI Interviewer" : "You"}
+                    </span>
+                    {turn.content}
+                  </div>
+                ))}
+                <div ref={transcriptEndRef} />
+              </div>
             </div>
-            {/* Connection */}
-            <div className="flex items-center gap-2 text-xs text-gray-500">
-              {isConnected ? (
-                <><Wifi className="h-3.5 w-3.5 text-green-500" /><span className="text-green-400">Connected</span></>
-              ) : (
-                <><WifiOff className="h-3.5 w-3.5 text-amber-500" /><span className="text-amber-400">Reconnecting…</span></>
-              )}
-              {isRecording && (
-                <span className="ml-auto text-gray-500">{chunksUploaded} chunk{chunksUploaded !== 1 ? "s" : ""} saved</span>
-              )}
+
+            <div className="shrink-0 space-y-2 border-t border-white/10 p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">Focus</span>
+                <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                  focusStatus === "focused" ? "bg-green-900/60 text-green-400" :
+                  focusStatus === "blurred" ? "bg-amber-900/60 text-amber-400" : "bg-red-900/60 text-red-400"
+                }`}>
+                  {focusStatus === "focused" ? "On screen" : focusStatus === "blurred" ? "Window unfocused" : "Tab hidden"}
+                </span>
+              </div>
+              <div>
+                <div className="mb-1 flex items-center justify-between">
+                  <div className="flex items-center gap-1 text-xs text-gray-400">
+                    <Shield className="h-3 w-3" />
+                    Integrity Score
+                  </div>
+                  <span className={`text-xs font-bold ${
+                    integrityScore >= 80 ? "text-green-400" : integrityScore >= 60 ? "text-amber-400" : "text-red-400"
+                  }`}>{integrityScore}/100</span>
+                </div>
+                <div className="h-1.5 w-full rounded-full bg-gray-700">
+                  <div
+                    className={`h-1.5 rounded-full transition-all duration-500 ${
+                      integrityScore >= 80 ? "bg-green-500" : integrityScore >= 60 ? "bg-amber-500" : "bg-red-500"
+                    }`}
+                    style={{ width: `${integrityScore}%` }}
+                  />
+                </div>
+                {violations.length > 0 && (
+                  <p className="mt-1 text-[10px] text-gray-500">{violations.length} event{violations.length !== 1 ? "s" : ""} recorded</p>
+                )}
+                <p className="mt-1 text-[10px] text-gray-500">
+                  AI proctoring:{" "}
+                  <span className={
+                    proctorAiStatus === "ready" ? "text-green-400" :
+                    proctorAiStatus === "unavailable" ? "text-amber-400" : "text-gray-400"
+                  }>
+                    {proctorAiStatus === "ready" ? "active" :
+                     proctorAiStatus === "loading" ? "loading models…" :
+                     proctorAiStatus === "unavailable" ? "unavailable — basic checks only" : "off"}
+                  </span>
+                </p>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-gray-500">
+                {isConnected ? (
+                  <><Wifi className="h-3.5 w-3.5 text-green-500" /><span className="text-green-400">Connected</span></>
+                ) : (
+                  <><WifiOff className="h-3.5 w-3.5 text-amber-500" /><span className="text-amber-400">Reconnecting…</span></>
+                )}
+                {isRecording && (
+                  <span className="ml-auto text-gray-500">{chunksUploaded} chunk{chunksUploaded !== 1 ? "s" : ""} saved</span>
+                )}
+              </div>
             </div>
           </div>
+        )}
+      </div>
+
+      {/* ─── Bottom control bar ─────────────────────────────────────────── */}
+      <div className="grid shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-3 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+        <div className="flex min-w-0 items-center gap-3 text-sm text-gray-300">
+          {isConnected && <span className="font-mono">{formatTime(elapsedSeconds)}</span>}
+          {isRecording && (
+            <span className="flex items-center gap-1.5 text-xs">
+              <Circle className="h-2.5 w-2.5 fill-red-500 text-red-500" />
+              Recording
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center justify-center gap-3">
+          <ControlButton
+            onClick={toggleMic}
+            active={!micMuted}
+            activeIcon={<Mic className="h-5 w-5" />}
+            inactiveIcon={<MicOff className="h-5 w-5" />}
+            label={micMuted ? "Turn on microphone" : "Turn off microphone"}
+          />
+          <ControlButton
+            onClick={toggleCam}
+            active={!camOff}
+            activeIcon={<Video className="h-5 w-5" />}
+            inactiveIcon={<VideoOff className="h-5 w-5" />}
+            label={camOff ? "Turn on camera" : "Turn off camera"}
+          />
+          {pipelineActive && started && (
+            <button
+              onClick={() => finishAnswer()}
+              disabled={!canFinishAnswer}
+              title="Press when you've finished your answer (or press Space)"
+              className={`flex h-11 items-center gap-2 rounded-full px-4 text-sm font-semibold transition-colors ${
+                canFinishAnswer
+                  ? "bg-[#8ab4f8] text-[#202124] hover:bg-[#aecbfa]"
+                  : "cursor-not-allowed bg-white/10 text-gray-500"
+              }`}
+            >
+              <Check className="h-4 w-4" />
+              Done answering
+            </button>
+          )}
+          <ControlButton
+            onClick={() => setCaptionsOn((v) => !v)}
+            active={captionsOn}
+            activeIcon={<Captions className="h-5 w-5" />}
+            inactiveIcon={<CaptionsOff className="h-5 w-5" />}
+            label={captionsOn ? "Turn off captions" : "Turn on captions"}
+          />
+          <button
+            onClick={async () => {
+              await endEarly();
+              disconnect();
+              router.push(`/interview/${params.token}`);
+            }}
+            title="Leave interview"
+            className="flex h-11 w-14 items-center justify-center rounded-full bg-red-600 text-white hover:bg-red-700"
+          >
+            <PhoneOff className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="flex min-w-0 items-center justify-end gap-2">
+          {started && !debugMode && !isFullscreen && typeof document !== "undefined" && document.fullscreenEnabled && (
+            <button
+              onClick={() => document.documentElement.requestFullscreen?.().catch(() => {})}
+              className="rounded-full bg-[#8ab4f8] px-3 py-1 text-xs font-semibold text-[#202124] hover:bg-[#aecbfa]"
+            >
+              Return to full screen
+            </button>
+          )}
+          {started && (
+            <span className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium ${
+              focusStatus === "tab_hidden"
+                ? "bg-red-600/90 text-white"
+                : focusStatus === "blurred"
+                ? "bg-amber-500/90 text-white"
+                : "bg-white/10 text-gray-200"
+            }`}>
+              <ShieldCheck className="h-3.5 w-3.5" />
+              {focusStatus === "tab_hidden"
+                ? "Return to the interview tab"
+                : focusStatus === "blurred"
+                ? "Interview window not in focus"
+                : "Monitored"}
+            </span>
+          )}
         </div>
       </div>
 
-      {/* Bottom: mic / cam / leave only — monitoring + REC + timer stay on the video overlay */}
-      <div className="flex shrink-0 flex-col gap-2 border-t border-white/10 bg-gray-900 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-        <div className="flex flex-wrap items-center justify-center gap-3">
-        <ControlButton
-          onClick={toggleMic}
-          active={!micMuted}
-          activeIcon={<Mic className="h-5 w-5" />}
-          inactiveIcon={<MicOff className="h-5 w-5" />}
-          label={micMuted ? "Unmute" : "Mute"}
-        />
-        <ControlButton
-          onClick={toggleCam}
-          active={!camOff}
-          activeIcon={<Video className="h-5 w-5" />}
-          inactiveIcon={<VideoOff className="h-5 w-5" />}
-          label={camOff ? "Show Camera" : "Hide Camera"}
-        />
-        <button
-          onClick={async () => {
-            await endEarly();
-            disconnect();
-            router.push(`/interview/${params.token}`);
-          }}
-          className="rounded-full bg-red-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-red-700"
-        >
-          Leave
-        </button>
-        </div>
-      </div>
-
-      {/* ─── Debug log panel ──────────────────────────────────────── */}
+      {/* ─── Debug log panel (Settings → Debug mode only) ──────────────── */}
+      {debugMode && (
       <div className="shrink-0 border-t border-white/10 bg-gray-950">
-        {/* Header */}
         <button
           onClick={() => setShowLogs((v) => !v)}
           className="flex w-full items-center justify-between px-4 py-2 text-left"
@@ -708,6 +899,29 @@ export default function InterviewRoomPage() {
             </span>
             <span className="text-xs text-gray-500">
               FLOW &bull; LLM &bull; TTS &bull; STT &bull; MIC
+            </span>
+            {/* Which voice engine is running, and if it isn't GPT-Live, why not. */}
+            <span
+              className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                liveActive
+                  ? "bg-violet-900/60 text-violet-300"
+                  : fallbackReason
+                    ? "bg-amber-900/60 text-amber-300"
+                    : liveEligible
+                      ? "bg-violet-900/40 text-violet-300"
+                      : "bg-gray-800 text-gray-300"
+              }`}
+              title={fallbackReason ?? undefined}
+            >
+              {liveActive
+                ? "Engine: GPT-Live"
+                : fallbackReason
+                  ? `Engine: Pipeline — GPT-Live failed: ${describeLiveFallback(fallbackReason)}`
+                  : forcedLegacy
+                    ? "Engine: Standard (forced by ?engine=legacy)"
+                    : liveEligible
+                      ? "Engine: GPT-Live ready — click Start"
+                      : "Engine: Pipeline (Deepgram + Aura voice)"}
             </span>
           </div>
           <span className="text-xs text-gray-400">{showLogs ? "▼" : "▶"}</span>
@@ -757,11 +971,39 @@ export default function InterviewRoomPage() {
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
+
+/** A Meet-style participant tile: blue ring while speaking, name label bottom-left. */
+function Tile({
+  name,
+  speaking,
+  micOff,
+  children,
+}: {
+  name: string;
+  speaking: boolean;
+  micOff?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className={`relative min-h-0 overflow-hidden rounded-2xl bg-[#3c4043] ring-[3px] transition-shadow duration-200 ${
+        speaking ? "ring-[#8ab4f8]" : "ring-transparent"
+      }`}
+    >
+      {children}
+      <div className="absolute bottom-2 left-2 z-10 flex items-center gap-1.5 rounded-md bg-black/55 px-2 py-0.5 text-xs font-medium text-white">
+        {micOff && <MicOff className="h-3 w-3 text-red-400" />}
+        {name}
+      </div>
+    </div>
+  );
+}
 
 function ControlButton({
   onClick,

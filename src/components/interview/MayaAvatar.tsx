@@ -1,18 +1,41 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { AIStatus } from "@/hooks/useInterview";
+import { useSimliAvatar } from "@/hooks/useSimliAvatar";
 import {
   INTERVIEW_AVATAR_CHANGED_EVENT,
   normalizeInterviewerAvatarId,
   type InterviewerAvatarId,
 } from "@/lib/interviewerAvatar";
 
+/** Wiring for the lip-sync avatar (only used by the "real" avatar on the GPT-Live engine). */
+export interface SimliAvatarProps {
+  interviewToken: string;
+  /** Maya's incoming GPT-Live audio track. */
+  audioTrack: MediaStreamTrack | null;
+  /** True only while the interview is running on the GPT-Live engine. */
+  enabled: boolean;
+  /** true = avatar is visibly rendering, parent should mute raw audio; false = unmute. */
+  onActiveChange: (active: boolean) => void;
+  onTelemetry?: (eventName: string, attrs?: Record<string, unknown>) => void;
+  /** Simli's speaking/silent events (what the candidate still sees and hears). */
+  onSpeakingChange?: (speaking: boolean) => void;
+  /** Context for the "provider stopped us" diagnostic. */
+  getDebugContext?: () => Record<string, unknown>;
+  /** The candidate has clicked Start (placeholder text changes; photo fallback becomes possible). */
+  interviewStarted: boolean;
+}
+
 interface MayaAvatarProps {
   status: AIStatus;
   size?: "sm" | "md" | "lg";
   /** Recruiter default from `/api/sessions/.../start` — wins over localStorage (candidate browsers). */
   serverAvatarId?: InterviewerAvatarId | null;
+  /** Optional lip-sync wiring; ignored by the cartoon avatars. */
+  simli?: SimliAvatarProps;
+  /** "circle" = classic ring avatar; "tile" = fills a Meet-style video tile. */
+  variant?: "circle" | "tile";
 }
 
 const SIZE = { sm: 100, md: 160, lg: 220 };
@@ -521,6 +544,121 @@ function ChenFace({ status, px }: { status: AIStatus; px: number }) {
   );
 }
 
+// ── Real-person face (photo + optional Simli lip-sync video) ──────────────────
+
+const noopActive = () => {};
+
+/** Neutral "Maya" tile shown until her live face is ready — never a still photo that then jumps. */
+function MayaPlaceholder({ text, busy, compact }: { text: string; busy: boolean; compact?: boolean }) {
+  return (
+    <div
+      style={{ position: "absolute", inset: 0 }}
+      className="flex flex-col items-center justify-center gap-3 bg-gradient-to-b from-slate-800 to-slate-900"
+    >
+      <div
+        className={`flex items-center justify-center rounded-full font-semibold text-white ${
+          compact ? "h-14 w-14 text-xl" : "h-24 w-24 text-4xl"
+        } ${busy ? "animate-pulse" : ""}`}
+        style={{ background: "linear-gradient(135deg, #7c3aed 0%, #2563eb 100%)" }}
+      >
+        M
+      </div>
+      {!compact && <p className="px-4 text-center text-sm text-slate-300">{text}</p>}
+    </div>
+  );
+}
+
+function RealFace({
+  status,
+  px,
+  simli,
+  variant = "circle",
+}: {
+  status: AIStatus;
+  px: number;
+  simli?: SimliAvatarProps;
+  variant?: "circle" | "tile";
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const { phase } = useSimliAvatar({
+    interviewToken: simli?.interviewToken ?? "",
+    audioTrack: simli?.audioTrack ?? null,
+    enabled: !!simli?.enabled,
+    videoRef,
+    audioRef,
+    onActiveChange: simli?.onActiveChange ?? noopActive,
+    onTelemetry: simli?.onTelemetry,
+    onSpeakingChange: simli?.onSpeakingChange,
+    getDebugContext: simli?.getDebugContext,
+  });
+  const rendering = phase === "active";
+  const started = !!simli?.interviewStarted;
+  // The still photo is ONLY a fallback: the live face failed, or this interview runs on the standard
+  // engine (no GPT-Live audio to lip-sync). Before Start, and while connecting, a neutral placeholder
+  // shows instead — the photo-then-jump-to-video switch looked like two different people.
+  const showPhoto = !rendering && (phase === "failed" || (started && !simli?.enabled));
+  const showPlaceholder = !rendering && !showPhoto;
+
+  const content = (
+      <div style={{ position: "relative", width: "100%", height: "100%", background: "#0f172a" }}>
+        {showPhoto && (
+          <div
+            aria-hidden
+            style={{
+              position: "absolute",
+              inset: 0,
+              backgroundImage: "url(/avatars/maya-real.webp)",
+              backgroundSize: variant === "tile" ? "cover" : "auto 118%",
+              backgroundPosition: variant === "tile" ? "50% 25%" : "50% 18%",
+              backgroundRepeat: "no-repeat",
+            }}
+          />
+        )}
+        {showPlaceholder && (
+          <MayaPlaceholder
+            text={started ? "Maya is joining…" : "Maya will join when you start"}
+            busy={started}
+            compact={variant === "circle"}
+          />
+        )}
+        {/* Lip-synced video fades in only once Simli is visibly rendering. */}
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            opacity: rendering ? 1 : 0,
+            transition: "opacity 300ms ease",
+          }}
+        />
+        <audio ref={audioRef} autoPlay />
+      </div>
+  );
+
+  if (variant === "tile") return content;
+  return (
+    <AvatarShell status={status} px={px} name="Maya"
+      blinkKey="realBlink"
+      ringColors={["#3b82f6","#22c55e","#f59e0b","#475569"]}
+      conicColors={[
+        "conic-gradient(from 0deg,#3b82f6,#8b5cf6,#06b6d4,#3b82f6)",
+        "conic-gradient(from 0deg,#22c55e,#06b6d4,#22c55e)",
+        "conic-gradient(from 0deg,#f59e0b,#ef4444,#f59e0b)",
+        "conic-gradient(from 0deg,#475569,#334155,#475569)",
+      ]}
+    >
+      {content}
+    </AvatarShell>
+  );
+}
+
 // ── Nova Face (AI Robot) ──────────────────────────────────────────────────────
 
 function NovaFace({ status, px }: { status: AIStatus; px: number }) {
@@ -643,6 +781,8 @@ export default function MayaAvatar({
   status,
   size = "md",
   serverAvatarId,
+  simli,
+  variant = "circle",
 }: MayaAvatarProps) {
   const px = SIZE[size];
   const resolvedServer = serverAvatarId
@@ -685,14 +825,28 @@ export default function MayaAvatar({
 
   const avatarId = resolvedServer ?? storedAvatarId;
 
-  switch (avatarId) {
-    case "alex":   return <AlexFace   status={status} px={px} />;
-    case "sam":    return <SamFace    status={status} px={px} />;
-    case "jordan": return <JordanFace status={status} px={px} />;
-    case "priya":  return <PriyaFace  status={status} px={px} />;
-    case "zara":   return <ZaraFace   status={status} px={px} />;
-    case "chen":   return <ChenFace   status={status} px={px} />;
-    case "nova":   return <NovaFace   status={status} px={px} />;
-    default:       return <MayaFace   status={status} px={px} />;
+  // The real person fills a whole video tile in the Meet-style room.
+  if (avatarId === "real") {
+    return <RealFace status={status} px={200} simli={simli} variant={variant} />;
   }
+
+  let face: JSX.Element;
+  switch (avatarId) {
+    case "alex":   face = <AlexFace   status={status} px={px} />; break;
+    case "sam":    face = <SamFace    status={status} px={px} />; break;
+    case "jordan": face = <JordanFace status={status} px={px} />; break;
+    case "priya":  face = <PriyaFace  status={status} px={px} />; break;
+    case "zara":   face = <ZaraFace   status={status} px={px} />; break;
+    case "chen":   face = <ChenFace   status={status} px={px} />; break;
+    case "nova":   face = <NovaFace   status={status} px={px} />; break;
+    default:       face = <MayaFace   status={status} px={px} />;
+  }
+  // Cartoon avatars sit centred in the tile, like a participant with their camera off.
+  return variant === "tile" ? (
+    <div className="flex h-full w-full items-center justify-center bg-gradient-to-b from-slate-800 to-slate-900">
+      {face}
+    </div>
+  ) : (
+    face
+  );
 }

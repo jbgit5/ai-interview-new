@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { pool } from "@/lib/db";
+import { isLiveMasterEnabled } from "@/lib/live/guardrails";
 
 export async function GET(
   request: NextRequest,
@@ -23,7 +24,11 @@ export async function GET(
     return NextResponse.json({ error: "Job not found" }, { status: 404 });
   }
 
-  return NextResponse.json(result.rows[0]);
+  return NextResponse.json({
+    ...result.rows[0],
+    // Lets the edit page show the GPT-Live toggle only when the server has it switched on.
+    live_voice_available: isLiveMasterEnabled(),
+  });
 }
 
 export async function PATCH(
@@ -47,7 +52,7 @@ export async function PATCH(
   }
 
   const body = await request.json();
-  const { title, department, description, status, allow_probes } = body;
+  const { title, department, description, status, allow_probes, live_voice_enabled } = body;
 
   const validStatuses = ["draft", "active", "closed"];
   if (status !== undefined && !validStatuses.includes(status)) {
@@ -58,6 +63,15 @@ export async function PATCH(
   }
   if (allow_probes !== undefined && typeof allow_probes !== "boolean") {
     return NextResponse.json({ error: "allow_probes must be a boolean" }, { status: 400 });
+  }
+  if (live_voice_enabled !== undefined && typeof live_voice_enabled !== "boolean") {
+    return NextResponse.json({ error: "live_voice_enabled must be a boolean" }, { status: 400 });
+  }
+  if (live_voice_enabled === true && !isLiveMasterEnabled()) {
+    return NextResponse.json(
+      { error: "GPT-Live voice is not enabled on this server" },
+      { status: 400 }
+    );
   }
 
   const result = await pool.query(
@@ -80,5 +94,23 @@ export async function PATCH(
     ]
   );
 
-  return NextResponse.json(result.rows[0]);
+  // Separate statement: if migration 014 hasn't run, ordinary job edits above still work.
+  let row = result.rows[0];
+  if (typeof live_voice_enabled === "boolean") {
+    try {
+      const flagged = await pool.query(
+        `UPDATE jobs SET live_voice_enabled = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+        [live_voice_enabled, params.id]
+      );
+      row = flagged.rows[0];
+    } catch (err) {
+      console.error("[jobs] live_voice_enabled update failed (migration 014 applied?):", err);
+      return NextResponse.json(
+        { error: "Could not save the GPT-Live setting (database migration 014 missing?)" },
+        { status: 500 }
+      );
+    }
+  }
+
+  return NextResponse.json({ ...row, live_voice_available: isLiveMasterEnabled() });
 }

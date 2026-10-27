@@ -3,9 +3,10 @@ import OpenAI from "openai";
 import { pool } from "@/lib/db";
 import { buildSummaryPrompt } from "@/lib/prompts";
 import { computeAndUpsertSessionSummary } from "@/lib/telemetry/summary";
+import { computeIntegrityScore } from "@/lib/proctor/rules";
 
 // POST /api/sessions/[token]/end
-// Body: { integrity_score?: number; video_chunk_count?: number }
+// Body: { early_exit?: boolean }  (integrity_score in the body is ignored — computed from events)
 // Runs full analysis pipeline: scores → summary → insert analysis_results
 export async function POST(
   req: NextRequest,
@@ -14,7 +15,8 @@ export async function POST(
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const { token } = params;
   const body = await req.json().catch(() => ({}));
-  const integrityScore: number = body.integrity_score ?? 100;
+  // The integrity score is computed below from the proctoring events actually recorded. It used to be
+  // whatever the browser sent — always 100 for a normal finish — so violations never lowered it.
   const earlyExit: boolean = body.early_exit === true;
 
   const client = await pool.connect();
@@ -41,7 +43,12 @@ export async function POST(
       return Response.json({ ok: true, already_completed: true });
     }
 
-    // ── 2. Mark session completed ──────────────────────────────────────────
+    // ── 2. Mark session completed (integrity = 100 minus recorded violations) ──
+    const proctorEvents = await client.query(
+      `SELECT event_type FROM proctoring_events WHERE session_id = $1`,
+      [session.id]
+    );
+    const integrityScore = computeIntegrityScore(proctorEvents.rows);
     await client.query(
       `UPDATE interview_sessions
           SET status = 'completed',

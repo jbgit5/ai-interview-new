@@ -8,6 +8,7 @@ import { ArrowLeft, AlertTriangle } from "lucide-react";
 import CompetencyRadar from "@/components/reports/CompetencyRadar";
 import ReportActions from "@/components/reports/ActionButtons";
 import RecordingPlayer from "@/components/reports/RecordingPlayer";
+import { computeIntegrityScore } from "@/lib/proctor/rules";
 
 const RECOMMENDATION_META: Record<string, { label: string; color: string; bg: string }> = {
   strong_yes: { label: "Strong Yes", color: "text-emerald-700", bg: "bg-emerald-100" },
@@ -81,7 +82,9 @@ export default async function ReportPage({
         [sessionId]
       ),
       client.query(
-        `SELECT event_type, timestamp_ms, severity
+        // snapshot_path read via to_jsonb so a DB without migration 017 still renders the report.
+        `SELECT id, event_type, timestamp_ms, severity,
+                to_jsonb(proctoring_events)->>'snapshot_path' AS snapshot_path
            FROM proctoring_events
           WHERE session_id = $1
           ORDER BY timestamp_ms`,
@@ -141,6 +144,12 @@ export default async function ReportPage({
             >
               <ArrowLeft className="h-4 w-4" />
               Back to Candidates
+            </Link>
+            <Link
+              href={`/dashboard/diagnostics/${sessionId}`}
+              className="text-sm font-medium text-gray-500 hover:text-violet-600 transition-colors"
+            >
+              What happened in this interview?
             </Link>
             <ReportActions
               sessionId={sessionId}
@@ -434,14 +443,9 @@ export default async function ReportPage({
                   return acc;
                 }, {});
 
-                const integrityScore = Math.max(0, 100 - proctoringEvents.reduce((sum, e) => {
-                  const penalties: Record<string, number> = {
-                    tab_switch: 10, window_blur: 5, multi_face: 15, no_face: 8,
-                    gaze_away: 3, paste_detected: 5, devtools_open: 20,
-                    fullscreen_exit: 5, phone_detected: 20, right_click: 2,
-                  };
-                  return sum + (penalties[e.event_type] ?? 5);
-                }, 0));
+                // Same penalty table as the room and the server (src/lib/proctor/rules.ts).
+                const integrityScore = computeIntegrityScore(proctoringEvents);
+                const evidence = proctoringEvents.filter((e) => e.snapshot_path);
 
                 const scoreColor = integrityScore >= 80 ? "text-emerald-600" : integrityScore >= 60 ? "text-amber-500" : "text-red-500";
                 const scoreBg = integrityScore >= 80 ? "bg-emerald-50 border-emerald-100" : integrityScore >= 60 ? "bg-amber-50 border-amber-100" : "bg-red-50 border-red-100";
@@ -451,6 +455,7 @@ export default async function ReportPage({
                   no_face: "Not in Frame", gaze_away: "Looking Away", paste_detected: "Paste Attempt",
                   right_click: "Right Click", devtools_open: "DevTools Open",
                   fullscreen_exit: "Fullscreen Exit", phone_detected: "Phone Detected",
+                  multiple_monitors: "Second Monitor",
                 };
 
                 return (
@@ -540,6 +545,38 @@ export default async function ReportPage({
                               </div>
                             ))}
                         </div>
+
+                        {/* Evidence: camera snapshots taken at the moment of each camera-based violation */}
+                        {evidence.length > 0 && (
+                          <div className="mt-4">
+                            <p className="mb-2 text-[11px] font-bold uppercase tracking-widest text-gray-400">
+                              Evidence ({evidence.length})
+                            </p>
+                            <div className="grid grid-cols-2 gap-2">
+                              {evidence.map((e) => (
+                                <a
+                                  key={e.id}
+                                  href={`/api/proctor/snapshot/${e.id}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="group overflow-hidden rounded-lg border border-gray-200"
+                                  title="Open full size"
+                                >
+                                  {/* eslint-disable-next-line @next/next/no-img-element -- auth-protected API image, not a static asset */}
+                                  <img
+                                    src={`/api/proctor/snapshot/${e.id}`}
+                                    alt={`${LABELS[e.event_type] ?? e.event_type} at ${Math.round(e.timestamp_ms / 1000)}s`}
+                                    className="aspect-video w-full object-cover transition-opacity group-hover:opacity-90"
+                                    loading="lazy"
+                                  />
+                                  <p className="bg-gray-50 px-2 py-1 text-[11px] text-gray-600">
+                                    {LABELS[e.event_type] ?? e.event_type} · {Math.round(e.timestamp_ms / 1000)}s
+                                  </p>
+                                </a>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </>
                     )}
                   </div>

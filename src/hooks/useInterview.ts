@@ -137,6 +137,8 @@ export function useInterview({ sessionToken, telemetry }: UseInterviewOptions) {
   const wsReconnectCountRef = useRef(0);
   /** Observability: wall-clock when LLM request was sent (for E2E latency calc) */
   const turnLlmStartMsRef = useRef(0);
+  /** Observability: last time STT produced text — the true "candidate stopped talking" proxy */
+  const lastTranscriptActivityMsRef = useRef(0);
   const prevInterviewStateRef = useRef<InterviewState>("idle");
   /** Fresh reference so async Deepgram callbacks don’t enqueue with stale telemetry */
   const telemetryRef = useRef(telemetry);
@@ -473,6 +475,7 @@ export function useInterview({ sessionToken, telemetry }: UseInterviewOptions) {
 
     const traceForTurn = traceIdRef.current;
     const silenceToLlmStart = Date.now();
+    const lastActivityAtCommit = lastTranscriptActivityMsRef.current;
 
     try {
       // Retry loop — retries on network failures and 5xx errors only.
@@ -534,6 +537,11 @@ export function useInterview({ sessionToken, telemetry }: UseInterviewOptions) {
           action,
           llm_roundtrip_ms: llmRoundtripMs,
           silence_to_llm_start_ms: turnLlmStartMsRef.current - silenceToLlmStart,
+          // Comparable to live's last_candidate_delta_to_commentary_ms: last STT text → next
+          // question text ready (includes the fixed silence-commit wait that the field above omits).
+          engine: "legacy",
+          last_transcript_to_question_ms:
+            lastActivityAtCommit > 0 ? Date.now() - lastActivityAtCommit : null,
           ws_reconnect_count: wsReconnectCountRef.current,
         },
         trace_id: traceIdRef.current,
@@ -640,6 +648,7 @@ export function useInterview({ sessionToken, telemetry }: UseInterviewOptions) {
       }
       setCandidateListeningPhase("speaking");
       setTurnStateSynced("LISTENING");
+      lastTranscriptActivityMsRef.current = Date.now();
       scheduleSilenceCommit();
     },
     [addLog, scheduleSilenceCommit, setTurnStateSynced]

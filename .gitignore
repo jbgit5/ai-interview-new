@@ -15,6 +15,9 @@
 recordings/**
 !recordings/.gitkeep
 
+# uploaded CVs (personal data) — never commit
+cv-uploads/
+
 # production
 /build
 

@@ -47,6 +47,29 @@ function looksLikeClosingGratitude(text: string): boolean {
   return phrases.some((p) => t.includes(p));
 }
 
+// One shared client so keep-alive connections are reused across turns. Creating a client per
+// request (as before) pays a fresh TLS handshake to OpenAI on every single turn.
+let openaiSingleton: OpenAI | null = null;
+function getOpenAI(): OpenAI {
+  if (!openaiSingleton) openaiSingleton = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return openaiSingleton;
+}
+
+function envMs(name: string, fallback: number): number {
+  const n = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/**
+ * Time budget for the "brain" call. A normal turn takes ~2.5s, but we measured a 9.6s outlier
+ * with identical token counts (provider variance). Past this budget we stop waiting and let the
+ * existing bank-question guards pick the next question, so one slow call never stalls a
+ * candidate. 0 disables the timeout. Set TURN_BRAIN_TIMEOUT_MS=1 to force-test the fallback.
+ */
+const BRAIN_TIMEOUT_MS = envMs("TURN_BRAIN_TIMEOUT_MS", 7_000);
+/** The scorer is not needed to speak the next question; bound it so it can't hold the turn. */
+const SCORER_TIMEOUT_MS = envMs("TURN_SCORER_TIMEOUT_MS", 8_000);
+
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -62,7 +85,10 @@ export async function POST(
   req: NextRequest,
   { params }: { params: { token: string } }
 ) {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  // Arrival time: pre_ms (body parse + waiting for a DB connection) is reported with the brain
+  // telemetry, to tell server-side waiting apart from network/browser time.
+  const tArrive = Date.now();
+  const openai = getOpenAI();
   const { token } = params;
 
   const body = await req.json();
@@ -101,7 +127,9 @@ export async function POST(
                 (to_jsonb(j)->>'company_intro')
               ) AS company_intro,
               r.company_name,
-              s.candidate_name
+              s.candidate_name,
+              -- to_jsonb fallback: works even before migration 021 has run.
+              COALESCE(to_jsonb(s)->>'question_order', 'own_first') AS question_order
          FROM interview_sessions s
          JOIN jobs j ON j.id = s.job_id
          JOIN recruiters r ON r.id = j.recruiter_id
@@ -137,19 +165,23 @@ export async function POST(
         `SELECT id, text, category, difficulty, expected_hint
            FROM questions
           WHERE (job_id = $1 AND session_id IS NULL) OR session_id = $2
-          ORDER BY CASE WHEN session_id IS NOT NULL THEN 0 ELSE 1 END, order_index`,
-        [session.job_id, session.id]
+          -- HR's choice per interview: candidate's own questions first (default) or common first.
+          ORDER BY CASE WHEN (session_id IS NOT NULL) = ($3 = 'own_first') THEN 0 ELSE 1 END, order_index`,
+        [session.job_id, session.id, session.question_order === "common_first" ? "common_first" : "own_first"]
       ),
       client.query(
         `SELECT competency FROM scoring_rubrics WHERE job_id = $1`,
         [session.job_id]
       ),
+      // A resubmitted answer (candidate kept talking → client merged and re-sent the same turn) must
+      // not see its own earlier partial answer, nor the reply generated for it that was never spoken.
       client.query(
         `SELECT role, content, question_id
            FROM transcript_turns
           WHERE session_id = $1
+            AND ($2::int IS NULL OR (turn_index <= $2 AND NOT (turn_index = $2 AND role = 'candidate')))
           ORDER BY turn_index, CASE WHEN role = 'interviewer' THEN 0 ELSE 1 END`,
-        [session.id]
+        [session.id, isOpeningTurn ? null : turnIndex]
       ),
       client.query(
         `SELECT question_id, probe_count FROM question_probe_counts WHERE session_id = $1`,
@@ -237,6 +269,7 @@ export async function POST(
               companyName: session.company_name ?? "the company",
               firstQuestion: questions[0]?.text ?? `Tell me about your background in ${session.job_title}.`,
               companyIntro: session.company_intro ?? undefined,
+              questionCount: questions.length,
             }),
           },
         ],
@@ -288,6 +321,7 @@ export async function POST(
           attrs: {
             opening: true,
             total_ms: Date.now() - tReq,
+            pre_ms: tReq - tArrive,
             llm_tokens: openingResponse.usage?.total_tokens ?? 0,
           },
         },
@@ -324,25 +358,64 @@ export async function POST(
       ...(clientAdmitsNoKnowledge ? { forceMoveOnAfterIgnorance: true as const } : {}),
     };
 
+    // Each call is timed separately (the turn waits for the slower of the two) so telemetry can
+    // show whether the brain or the scorer is the bottleneck. A failed/timed-out call resolves to
+    // null instead of failing the whole turn:
+    //   brain  → bank-driven fallback below (candidate still hears a valid next question)
+    //   scorer → this turn's score + off-topic check are skipped (never a fake default score)
+    let brainMs = 0;
+    let scorerMs = 0;
+    const callErrors = { brain: null as string | null, scorer: null as string | null };
+    const tCalls = Date.now();
+
     const [brainResponse, scoringResponse] = await Promise.all([
-      openai.chat.completions.create({
-        model: "gpt-4o",
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: buildInterviewSystemPrompt(promptOpts) },
-          ...fullHistory,
-        ],
-        temperature: 0.7,
-        max_tokens: 400,
-      }),
-      openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        response_format: { type: "json_object" },
-        messages: [{ role: "user", content: buildScoringPrompt(scoringOpts) }],
-        temperature: 0.3,
-        max_tokens: 300,
-      }),
-    ]);    tLlm = Date.now();
+      openai.chat.completions
+        .create(
+          {
+            model: "gpt-4o",
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: buildInterviewSystemPrompt(promptOpts) },
+              ...fullHistory,
+            ],
+            temperature: 0.7,
+            max_tokens: 400,
+          },
+          BRAIN_TIMEOUT_MS > 0 ? { timeout: BRAIN_TIMEOUT_MS, maxRetries: 0 } : undefined
+        )
+        .then((r) => {
+          brainMs = Date.now() - tCalls;
+          return r;
+        })
+        .catch((err: unknown) => {
+          brainMs = Date.now() - tCalls;
+          callErrors.brain = err instanceof Error ? err.message : String(err);
+          console.error(`[turn] brain call failed after ${brainMs}ms — using bank fallback:`, callErrors.brain);
+          return null;
+        }),
+      openai.chat.completions
+        .create(
+          {
+            model: "gpt-4o-mini",
+            response_format: { type: "json_object" },
+            messages: [{ role: "user", content: buildScoringPrompt(scoringOpts) }],
+            temperature: 0.3,
+            max_tokens: 300,
+          },
+          SCORER_TIMEOUT_MS > 0 ? { timeout: SCORER_TIMEOUT_MS, maxRetries: 0 } : undefined
+        )
+        .then((r) => {
+          scorerMs = Date.now() - tCalls;
+          return r;
+        })
+        .catch((err: unknown) => {
+          scorerMs = Date.now() - tCalls;
+          callErrors.scorer = err instanceof Error ? err.message : String(err);
+          console.error(`[turn] scorer call failed after ${scorerMs}ms — skipping score:`, callErrors.scorer);
+          return null;
+        }),
+    ]);
+    tLlm = Date.now();
     // ── 7. Parse brain response ────────────────────────────────────────────
     let brainJSON: {
       action: "probe" | "next" | "close";
@@ -351,10 +424,17 @@ export async function POST(
       notes: string;
     };
 
-    try {
-      brainJSON = JSON.parse(brainResponse.choices[0].message.content ?? "{}");
-    } catch {
-      return Response.json({ error: "Invalid JSON from AI brain" }, { status: 500 });
+    if (brainResponse === null) {
+      // Bank-driven stand-in. An empty "next" with no valid question_id is exactly what the
+      // hallucination guard below already repairs: it swaps in the next unasked bank question
+      // (preferring uncovered categories) or a clean close once the bank is exhausted.
+      brainJSON = { action: "next", question: "", question_id: null, notes: "brain_fallback" };
+    } else {
+      try {
+        brainJSON = JSON.parse(brainResponse.choices[0].message.content ?? "{}");
+      } catch {
+        return Response.json({ error: "Invalid JSON from AI brain" }, { status: 500 });
+      }
     }
 
     const { action: rawAction, question_id: rawQId } = brainJSON;
@@ -366,7 +446,17 @@ export async function POST(
     if (rawAction === "close" && candidateFirstName && nextQuestion) {
       const nameMentioned = nextQuestion.toLowerCase().includes(candidateFirstName.toLowerCase());
       if (!nameMentioned) {
-        nextQuestion = `Thank you, ${candidateFirstName}! ${nextQuestion}`;
+        // If the line already opens with "Thank you…", put the name INTO that sentence instead of
+        // prepending another one ("Thank you, try! Thank you for your time" was spoken to a candidate).
+        const thanks = nextQuestion.trim().match(/^(thank you|thanks)\b([\s\S]*)$/i);
+        if (thanks) {
+          const rest = thanks[2];
+          nextQuestion = /^\s*(for|so much|very much|again)\b/i.test(rest)
+            ? `${thanks[1]}, ${candidateFirstName},${rest}`
+            : `${thanks[1]}, ${candidateFirstName}${rest}`;
+        } else {
+          nextQuestion = `Thank you, ${candidateFirstName}! ${nextQuestion}`;
+        }
       }
     }
     // Validate GPT's returned question_id — must be an actual question ID from DB.
@@ -452,14 +542,49 @@ export async function POST(
       }
     }
 
-    // Update probe count if this was a probe turn
+    // Superseded? The client re-sent this turn with a longer (merged) answer while we were thinking.
+    // The newer request owns the turn — write nothing, so a slow old reply can't overwrite it.
+    const latestAnswer = await client.query(
+      `SELECT content FROM transcript_turns WHERE session_id = $1 AND turn_index = $2 AND role = 'candidate'`,
+      [session.id, turnIndex]
+    );
+    if (latestAnswer.rows[0] && latestAnswer.rows[0].content !== candidateAnswer) {
+      return Response.json({ error: "superseded" }, { status: 409 });
+    }
+
+    // Update probe count if this was a probe turn. A resubmitted turn whose earlier submission already
+    // counted a probe (recorded in resume_state.probe_counted_for) must not count it twice.
+    const prevState = (() => {
+      const raw = session.resume_state;
+      try {
+        return (typeof raw === "string" ? JSON.parse(raw) : raw) as
+          | { turn_index?: number; probe_counted_for?: string | null }
+          | null;
+      } catch {
+        return null;
+      }
+    })();
+    const alreadyCountedFor =
+      prevState?.turn_index === nextTurnIndex ? prevState.probe_counted_for ?? null : null;
+    let probeCountedFor: string | null = null;
     if (action === "probe" && currentQId) {
+      probeCountedFor = currentQId;
+      if (alreadyCountedFor !== currentQId) {
+        await client.query(
+          `INSERT INTO question_probe_counts (session_id, question_id, probe_count)
+           VALUES ($1, $2, 1)
+           ON CONFLICT (session_id, question_id) DO UPDATE
+             SET probe_count = question_probe_counts.probe_count + 1`,
+          [session.id, currentQId]
+        );
+      }
+    }
+    if (alreadyCountedFor && alreadyCountedFor !== probeCountedFor) {
+      // The earlier submission probed but this one doesn't: undo its count.
       await client.query(
-        `INSERT INTO question_probe_counts (session_id, question_id, probe_count)
-         VALUES ($1, $2, 1)
-         ON CONFLICT (session_id, question_id) DO UPDATE
-           SET probe_count = question_probe_counts.probe_count + 1`,
-        [session.id, currentQId]
+        `UPDATE question_probe_counts SET probe_count = GREATEST(0, probe_count - 1)
+          WHERE session_id = $1 AND question_id = $2`,
+        [session.id, alreadyCountedFor]
       );
     }
 
@@ -536,10 +661,12 @@ export async function POST(
       relevance_note?: string;
     } = {};
 
-    try {
-      scoringJSON = JSON.parse(scoringResponse.choices[0].message.content ?? "{}");
-    } catch {
-      console.error("[turn] Scoring parse failed — skipping relevance check");
+    if (scoringResponse) {
+      try {
+        scoringJSON = JSON.parse(scoringResponse.choices[0].message.content ?? "{}");
+      } catch {
+        console.error("[turn] Scoring parse failed — skipping relevance check");
+      }
     }
 
     // Gentle one-time off-topic redirect:
@@ -596,24 +723,33 @@ export async function POST(
       });
     }
 
-    // Save scoring to DB (non-blocking — failure must not break the interview turn)
-    try {
-      await client.query(
-        `INSERT INTO question_scores
-           (session_id, question_id, turn_index, score, reasoning, competencies)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [
-          session.id,
-          lastInterviewerRow?.question_id ?? null,
-          turnIndex,
-          Math.min(10, Math.max(1, scoringJSON.overall ?? 5)),
-          scoringJSON.reasoning ?? "",
-          JSON.stringify(scoringJSON.scores ?? {}),
-        ]
-      );
-    } catch (err) {
-      // Scoring failure should not block the interview — log and continue
-      console.error("Scoring save failed:", err);
+    // Save scoring to DB (non-blocking — failure must not break the interview turn).
+    // Skipped entirely when the scorer call failed, so the report never gets a made-up score.
+    if (scoringResponse) {
+      try {
+        // One score per answer: a resubmitted turn (candidate kept talking, answer merged) replaces
+        // the score of the partial answer instead of adding a second, lower one.
+        await client.query(
+          `DELETE FROM question_scores WHERE session_id = $1 AND turn_index = $2`,
+          [session.id, turnIndex]
+        );
+        await client.query(
+          `INSERT INTO question_scores
+             (session_id, question_id, turn_index, score, reasoning, competencies)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            session.id,
+            lastInterviewerRow?.question_id ?? null,
+            turnIndex,
+            Math.min(10, Math.max(1, scoringJSON.overall ?? 5)),
+            scoringJSON.reasoning ?? "",
+            JSON.stringify(scoringJSON.scores ?? {}),
+          ]
+        );
+      } catch (err) {
+        // Scoring failure should not block the interview — log and continue
+        console.error("Scoring save failed:", err);
+      }
     }
 
     // ── 9. Save AI's next question / closing to transcript_turns ──────────
@@ -635,6 +771,7 @@ export async function POST(
         ? [...questionsAsked, nextQId]
         : questionsAsked,
       last_action: action,
+      probe_counted_for: probeCountedFor,
     };
 
     await client.query(
@@ -657,9 +794,9 @@ export async function POST(
       llm_ms:                   tLlm     - tDbLoad,
       write_ms:                 tNow     - tLlm,
       total_ms:                 tNow     - tReq,
-      brain_prompt_tokens:      brainResponse.usage?.prompt_tokens     ?? 0,
-      brain_completion_tokens:  brainResponse.usage?.completion_tokens ?? 0,
-      scoring_total_tokens:     scoringResponse.usage?.total_tokens    ?? 0,
+      brain_prompt_tokens:      brainResponse?.usage?.prompt_tokens     ?? 0,
+      brain_completion_tokens:  brainResponse?.usage?.completion_tokens ?? 0,
+      scoring_total_tokens:     scoringResponse?.usage?.total_tokens    ?? 0,
       offtopic_redirect:        scoringJSON.is_relevant === false && !session.offtopic_redirect_issued,
     };
     console.log(JSON.stringify({ event: "turn_metrics", ...metricsRow }));
@@ -698,9 +835,19 @@ export async function POST(
         attrs: {
           action,
           total_ms: metricsRow.total_ms,
+          pre_ms: tReq - tArrive,
           llm_ms: metricsRow.llm_ms,
           db_session_ms: metricsRow.db_session_ms,
           db_parallel_ms: metricsRow.db_parallel_ms,
+          // Which OpenAI call is the bottleneck? The turn waits for the slower one, so
+          // scorer_extra_wait_ms > 0 means scoring is directly delaying the candidate.
+          brain_model: "gpt-4o",
+          brain_ms: brainMs,
+          scorer_ms: scorerMs,
+          scorer_extra_wait_ms: Math.max(0, scorerMs - brainMs),
+          brain_fallback: brainResponse === null,
+          scorer_failed: scoringResponse === null,
+          ...(callErrors.brain ? { brain_error: callErrors.brain.slice(0, 160) } : {}),
         },
       },
     ];

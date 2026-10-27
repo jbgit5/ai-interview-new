@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useCallback, useEffect } from "react";
+import { useRef, useCallback, useEffect, useMemo } from "react";
 import type { SessionTelemetryApi } from "@/lib/telemetry/types";
 
 const FLUSH_MS = 2_000;
@@ -102,5 +102,8 @@ export function useSessionTelemetry(sessionToken: string): SessionTelemetryApi {
     };
   }, [flushInternal]);
 
-  return { enqueue, flush: flushInternal };
+  // Stable identity: consumers (useInterview's state-change effect, room page callbacks) list this
+  // object in effect/callback deps. A fresh object every render made that effect fire on every
+  // re-render — 500+ `interview.state_change` rows (idle→idle) in a single 4-minute session.
+  return useMemo(() => ({ enqueue, flush: flushInternal }), [enqueue, flushInternal]);
 }

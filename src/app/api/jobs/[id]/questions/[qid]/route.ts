@@ -24,6 +24,25 @@ export async function DELETE(
     return NextResponse.json({ error: "Question not found" }, { status: 404 });
   }
 
+  // Common questions are read live when an interview runs. Never let deleting the last one leave
+  // an invited (not yet finished) candidate who has no questions of their own with an empty interview.
+  const stranded = await pool.query(
+    `SELECT COUNT(*)::int AS n
+       FROM interview_sessions s
+      WHERE s.job_id = $1 AND s.status IN ('pending', 'in_progress')
+        AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.session_id = s.id)
+        AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.job_id = $1 AND q.session_id IS NULL AND q.id <> $2)`,
+    [params.id, params.qid]
+  );
+  if (stranded.rows[0].n > 0) {
+    return NextResponse.json(
+      {
+        error: `This is the last common question, and ${stranded.rows[0].n} invited candidate(s) have no questions of their own. Add another question first, or cancel those invites.`,
+      },
+      { status: 409 }
+    );
+  }
+
   await pool.query(
     "UPDATE transcript_turns SET question_id = NULL WHERE question_id = $1",
     [params.qid]

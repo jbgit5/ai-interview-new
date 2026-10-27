@@ -1127,5 +1127,24 @@ export function useSpeechCapture({
 
   const getSharedStream = useCallback((): MediaStream | null => streamRef.current, []);
 
-  return { start, activate, stop, destroy, isSessionAlive, getSharedStream };
+  /**
+   * Ask Deepgram to finalise the words it is still holding as "interim" right now (its `Finalize`
+   * control message). Used when the candidate has gone quiet but Deepgram hasn't closed the phrase —
+   * measured: it kept re-sending the same unfinished text for ~5 s. Returns false if not possible
+   * (Web Speech fallback, socket not open, muted).
+   */
+  const finalize = useCallback((): boolean => {
+    const conn = connectionRef.current;
+    if (!activeRef.current || !conn || conn.getReadyState?.() !== 1) return false;
+    try {
+      if (typeof conn.finalize === "function") conn.finalize();
+      else conn.send(JSON.stringify({ type: "Finalize" }));
+      enqueueSpeechTelemetry?.({ event_name: "stt.finalize_requested", attrs: {} });
+      return true;
+    } catch {
+      return false;
+    }
+  }, [enqueueSpeechTelemetry]);
+
+  return { start, activate, stop, destroy, isSessionAlive, getSharedStream, finalize };
 }
